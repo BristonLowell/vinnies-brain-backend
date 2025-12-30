@@ -1,0 +1,274 @@
+{
+  "knowledge_base": {
+    "scope": {
+      "brand": "Airstream",
+      "model_years": "2010–2025",
+      "tone": "technical-but-clear",
+      "use_cases": ["customer", "staff"]
+    },
+    "articles": [
+      {
+        "id": "AS-001",
+        "title": "Water Stains Around Windows",
+        "category": "Water / Leaks",
+        "severity": "Moderate to Urgent",
+        "description": "Water intrusion near windows is commonly caused by aging sealant, failed window gaskets, or leaks originating above the window such as marker lights or seams.",
+        "symptoms": [
+          "Staining below or beside windows",
+          "Damp trim after rain",
+          "Moisture appears after storms"
+        ],
+        "initial_checks": [
+          "Inspect window frame seal for cracks or separation",
+          "Check marker lights above the window",
+          "Look for streaking indicating water travel"
+        ],
+        "model_year_notes": {
+          "2010-2016": "Sealant failure is most common",
+          "2017-2025": "Marker light and upper seam leaks are frequent contributors"
+        },
+        "stop_and_escalate": [
+          "Soft wall material",
+          "Active dripping",
+          "Musty odor behind trim"
+        ],
+        "recommended_action": "Professional leak inspection recommended"
+      },
+      {
+        "id": "AS-002",
+        "title": "Leak Only After Heavy Rain",
+        "category": "Water / Leaks",
+        "severity": "Moderate",
+        "description": "Leaks that occur only during heavy rain usually indicate pressure-driven water entry rather than direct hose-level intrusion.",
+        "common_causes": [
+          "Roof seams",
+          "Marker or clearance lights",
+          "Upper rivet lines"
+        ],
+        "initial_checks": [
+          "Identify leak location relative to roof features",
+          "Inspect roof seams for cracking or gaps",
+          "Check sealant around roof-mounted components"
+        ],
+        "model_year_notes": {
+          "2010-2018": "Sealant shrinkage over time is common",
+          "2019-2025": "UV degradation of factory sealant still occurs"
+        },
+        "stop_and_escalate": [
+          "Repeating leaks after resealing",
+          "Ceiling discoloration"
+        ]
+      },
+      {
+        "id": "AS-003",
+        "title": "Marker Light Leaks",
+        "category": "Water / Leaks",
+        "severity": "Moderate to High",
+        "description": "Marker lights are a common leak point where water can enter and travel unseen inside the wall structure.",
+        "symptoms": [
+          "Staining below windows",
+          "Moisture after rain",
+          "No visible roof leak"
+        ],
+        "initial_checks": [
+          "Inspect marker light sealant for cracks",
+          "Check for discoloration below lights",
+          "Ensure mounting screws are secure"
+        ],
+        "model_year_notes": {
+          "2010-2025": "Consistent issue across all modern models"
+        },
+        "stop_and_escalate": [
+          "Wall softness",
+          "Recurring stains"
+        ]
+      },
+      {
+        "id": "AS-004",
+        "title": "Moisture Under Bed or Dinette",
+        "category": "Interior Moisture",
+        "severity": "Moderate to Urgent",
+        "description": "Moisture in low areas often results from slow leaks or trapped condensation beneath flooring.",
+        "common_causes": [
+          "Water traveling from windows or roof",
+          "Plumbing condensation",
+          "Road spray intrusion"
+        ],
+        "initial_checks": [
+          "Determine if moisture is clean or musty",
+          "Inspect nearby exterior seams",
+          "Check for ongoing dampness"
+        ],
+        "model_year_notes": {
+          "2010-2015": "Older insulation retains moisture longer",
+          "2016-2025": "Improved materials but leaks still migrate"
+        },
+        "stop_and_escalate": [
+          "Wet insulation",
+          "Mold odor",
+          "Persistent moisture"
+        ]
+      },
+      {
+        "id": "AS-005",
+        "title": "Wet Floor Near Entry Door",
+        "category": "Water / Leaks",
+        "severity": "Moderate",
+        "description": "Door seals and surrounding seams experience flex and wear, making them common failure points.",
+        "common_causes": [
+          "Worn door gasket",
+          "Sealant failure at door frame",
+          "Water tracking inward"
+        ],
+        "initial_checks": [
+          "Inspect door gasket for gaps or compression loss",
+          "Examine sealant around door frame",
+          "Determine if moisture appears after rain or washing"
+        ],
+        "model_year_notes": {
+          "2010-2025": "Wear-related issue across all years"
+        },
+        "stop_and_escalate": [
+          "Floor softness",
+          "Recurring wetness"
+        ]
+      },
+      {
+        "id": "AS-006",
+        "title": "White Oxidation or Chalky Residue",
+        "category": "Exterior / Aluminum",
+        "severity": "Cosmetic to Preventative",
+        "description": "Aluminum oxidation occurs when protective coatings wear down, producing a chalky white residue.",
+        "confirmation": [
+          "Residue transfers to hand when touched",
+          "Dull aluminum appearance",
+          "No bubbling or pitting"
+        ],
+        "do_not": [
+          "Do not use acid-based cleaners",
+          "Do not use abrasive pads"
+        ],
+        "model_year_notes": {
+          "2010-2014": "Bare aluminum oxidizes more quickly",
+          "2015-2025": "Clear-coated finishes may haze"
+        },
+        "escalate_if": [
+          "Visible pitting",
+          "Rapid progression"
+        ]
+      },
+      {
+        "id": "AS-007",
+        "title": "Streaking Below Rivets or Seams",
+        "category": "Exterior / Aluminum",
+        "severity": "Cosmetic to Investigate",
+        "description": "Streaking is typically caused by moisture movement carrying dirt or oxidation residue.",
+        "initial_checks": [
+          "Determine if streaks are cosmetic or wet",
+          "Inspect sealant condition around rivets"
+        ],
+        "model_year_notes": {
+          "2010-2025": "Common aluminum behavior"
+        },
+        "escalate_if": [
+          "Interior moisture accompanies streaking"
+        ]
+      },
+      {
+        "id": "AS-008",
+        "title": "Clear Coat Hazing or Failure",
+        "category": "Exterior / Aluminum",
+        "severity": "Cosmetic to Progressive",
+        "description": "UV exposure degrades clear coat finishes, leading to hazing, cloudiness, or peeling.",
+        "symptoms": [
+          "Milky appearance",
+          "Uneven gloss"
+        ],
+        "model_year_notes": {
+          "2017-2025": "Clear coat issues more common",
+          "2010-2016": "Bare aluminum finishes"
+        },
+        "escalate_if": [
+          "Peeling or flaking is present"
+        ]
+      },
+      {
+        "id": "AS-009",
+        "title": "Corrosion Around Fasteners",
+        "category": "Exterior / Aluminum",
+        "severity": "Moderate",
+        "description": "Galvanic corrosion occurs where dissimilar metals meet, often accelerated by moisture.",
+        "initial_checks": [
+          "Determine if corrosion is surface-level",
+          "Check fastener integrity"
+        ],
+        "model_year_notes": {
+          "2010-2025": "Increases with age and moisture exposure"
+        },
+        "stop_and_escalate": [
+          "Loose fasteners",
+          "Aluminum pitting"
+        ]
+      },
+      {
+        "id": "AS-010",
+        "title": "Condensation on Windows or Walls",
+        "category": "Interior",
+        "severity": "Normal to Monitor",
+        "description": "Condensation forms when warm interior air meets cold aluminum surfaces.",
+        "confirmation": [
+          "Occurs in cold weather",
+          "Dries with ventilation",
+          "No staining present"
+        ],
+        "model_year_notes": {
+          "2010-2025": "Normal behavior in aluminum construction"
+        },
+        "escalate_if": [
+          "Moisture persists in warm conditions",
+          "Staining develops"
+        ]
+      },
+      {
+        "id": "AS-011",
+        "title": "Musty Smell With No Visible Leak",
+        "category": "Interior Moisture",
+        "severity": "Moderate to Investigate",
+        "description": "Musty odors often indicate hidden moisture behind panels or under flooring.",
+        "common_sources": [
+          "Past water intrusion",
+          "Trapped condensation"
+        ],
+        "initial_checks": [
+          "Determine when odor began",
+          "Check history of leaks"
+        ],
+        "model_year_notes": {
+          "2010-2014": "Moisture retention more common"
+        },
+        "escalate_if": [
+          "Odor persists after drying",
+          "Health concerns arise"
+        ]
+      },
+      {
+        "id": "AS-012",
+        "title": "Soft Floor Concerns",
+        "category": "Structural",
+        "severity": "High",
+        "description": "Soft flooring usually indicates ongoing or previous water intrusion and is not considered normal.",
+        "initial_checks": [
+          "Assess whether softness changes after drying",
+          "Identify proximity to doors, bathrooms, or windows"
+        ],
+        "model_year_notes": {
+          "2010-2025": "Not normal for modern Airstreams"
+        },
+        "stop_and_escalate": [
+          "Floor flexes under foot",
+          "Soft area expands"
+        ]
+      }
+    ]
+  }
+}
