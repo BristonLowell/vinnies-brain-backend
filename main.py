@@ -78,6 +78,43 @@ async def all_exception_handler(request: Request, exc: Exception):
 # -------------------------
 # Models
 # -------------------------
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
+
+class AdminArticleUpsertRequest(BaseModel):
+    id: Optional[str] = None
+    title: str
+    category: str
+    severity: str
+    years_min: int
+    years_max: int
+    customer_summary: str
+    clarifying_questions: List[str] = []
+    steps: List[str] = []
+    model_year_notes: List[str] = []
+    stop_and_escalate: List[str] = []
+    next_step: str
+
+def require_admin(x_admin_key: str | None):
+    if not ADMIN_API_KEY:
+        raise HTTPException(status_code=500, detail="ADMIN_API_KEY not set")
+    if not x_admin_key or x_admin_key != ADMIN_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+def make_retrieval_text_from_admin(a: AdminArticleUpsertRequest) -> str:
+    return "\n".join([
+        f"Title: {a.title}",
+        f"Category: {a.category}",
+        f"Severity: {a.severity}",
+        f"Applies: {a.years_min}-{a.years_max}",
+        f"Summary: {a.customer_summary}",
+        "Clarifying Questions: " + " | ".join(a.clarifying_questions),
+        "Steps: " + " | ".join(a.steps),
+        "Model Year Notes: " + " | ".join(a.model_year_notes),
+        "Stop & Escalate: " + " | ".join(a.stop_and_escalate),
+        f"Next Step: {a.next_step}",
+    ])
+
+
 class CreateSessionRequest(BaseModel):
     channel: str = "mobile"
     mode: str = Field(default="customer", pattern="^(customer|staff)$")
@@ -138,6 +175,64 @@ class FeedbackRequest(BaseModel):
 # -------------------------
 # DB helpers (psycopg2 requires cursor.execute)
 # -------------------------
+
+from fastapi import Header
+
+@app.post("/v1/admin/kb/upsert")
+def admin_kb_upsert(
+    req: AdminArticleUpsertRequest,
+    x_admin_key: str | None = Header(default=None),
+):
+    require_admin(x_admin_key)
+
+    article_id = req.id or str(uuid.uuid4())
+    retrieval_text = make_retrieval_text_from_admin(req)
+    emb = embed_text(retrieval_text)
+
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO kb_articles
+              (id, title, category, severity, years_min, years_max, customer_summary,
+               clarifying_questions, steps, model_year_notes, stop_and_escalate, next_step,
+               retrieval_text, embedding)
+            VALUES
+              (%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb,%s::jsonb,%s,%s,%s::vector)
+            ON CONFLICT (id) DO UPDATE SET
+              title=EXCLUDED.title,
+              category=EXCLUDED.category,
+              severity=EXCLUDED.severity,
+              years_min=EXCLUDED.years_min,
+              years_max=EXCLUDED.years_max,
+              customer_summary=EXCLUDED.customer_summary,
+              clarifying_questions=EXCLUDED.clarifying_questions,
+              steps=EXCLUDED.steps,
+              model_year_notes=EXCLUDED.model_year_notes,
+              stop_and_escalate=EXCLUDED.stop_and_escalate,
+              next_step=EXCLUDED.next_step,
+              retrieval_text=EXCLUDED.retrieval_text,
+              embedding=EXCLUDED.embedding,
+              updated_at=now()
+            """,
+            (
+                article_id,
+                req.title, req.category, req.severity,
+                req.years_min, req.years_max,
+                req.customer_summary,
+                json.dumps(req.clarifying_questions),
+                json.dumps(req.steps),
+                json.dumps(req.model_year_notes),
+                json.dumps(req.stop_and_escalate),
+                req.next_step,
+                retrieval_text,
+                emb,
+            ),
+        )
+        conn.commit()
+
+    return {"ok": True, "id": article_id}
+
+
 def db():
     return psycopg2.connect(
         DATABASE_URL,
