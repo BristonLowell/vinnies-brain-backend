@@ -5,6 +5,9 @@ import smtplib
 from email.message import EmailMessage
 from typing import List, Optional, Dict, Any, Tuple
 
+from psycopg import connect
+from psycopg.rows import dict_row
+
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.requests import Request
@@ -234,10 +237,8 @@ def admin_kb_upsert(
 
 
 def db():
-    return psycopg2.connect(
-        DATABASE_URL,
-        cursor_factory=psycopg2.extras.RealDictCursor
-    )
+    return connect(DATABASE_URL, row_factory=dict_row)
+
 
 
 def exec_one(conn, sql: str, params=()):
