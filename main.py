@@ -12,8 +12,6 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.requests import Request
 from pydantic import BaseModel, Field
-import psycopg2
-import psycopg2.extras
 from dotenv import load_dotenv
 import traceback
 
