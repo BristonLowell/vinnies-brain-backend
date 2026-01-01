@@ -4,7 +4,7 @@ import json
 import smtplib
 from fastapi import Header
 import re
-import psycopg2.extras
+# import psycopg2.extras
 from email.message import EmailMessage
 from typing import List, Optional, Dict, Any, Tuple
 from typing import Any
@@ -19,7 +19,9 @@ from fastapi.requests import Request
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 import traceback
-
+import psycopg
+from psycopg.rows import dict_row
+from contextlib import contextmanager
 from openai_client import embed_text, generate_answer
 
 load_dotenv()
@@ -298,8 +300,13 @@ def admin_kb_upsert(
     return {"ok": True, "id": article_id}
 
 
+@contextmanager
 def db():
-    return connect(DATABASE_URL, row_factory=dict_row)
+    conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 
 
@@ -311,17 +318,14 @@ def exec_one(conn, sql: str, params=()):
     return row
 
 
-def exec_all(conn, sql: str, params=()):
-    # Ensure JSON/JSONB columns auto-decode into Python objects
-    # Safe to call more than once
-    psycopg2.extras.register_default_json(conn, loads=json.loads)
-    psycopg2.extras.register_default_jsonb(conn, loads=json.loads)
-
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute(sql, params)
-    rows = cur.fetchall()
-    cur.close()
-    return rows
+def exec_all(conn, sql: str, params=()) -> List[Dict[str, Any]]:
+    """
+    Execute a query and return all rows as dictionaries.
+    Requires psycopg v3 connection created with row_factory=dict_row.
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        return cur.fetchall()
 
 
 def exec_no_return(conn, sql: str, params=()):
