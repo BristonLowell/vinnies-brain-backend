@@ -1,0 +1,437 @@
+[
+  {
+    "title": "Water leaking around window during rain",
+    "category": "Water / Leaks",
+    "severity": "High",
+    "years_min": 2010,
+    "years_max": 2025,
+    "customer_summary": "Water enters around or below a window during rain or washing.",
+    "clarifying_questions": [
+      "Does the leak only happen during rain or washing?",
+      "Is the water coming from the top half of the window?",
+      "Has this window ever been removed or replaced?"
+    ],
+    "steps": [
+      "Inspect exterior window sealant for cracks or gaps.",
+      "Check window frame screws for looseness.",
+      "Press gently on the window frame to check for movement.",
+      "Inspect the interior wall below the window for moisture."
+    ],
+    "model_year_notes": [
+      "Sealant shrinkage is common after several years.",
+      "Previous window removal increases leak risk."
+    ],
+    "stop_and_escalate": [
+      "Active dripping inside wall cavity",
+      "Soft wall or floor below window",
+      "Visible mold or musty odor"
+    ],
+    "next_step": "Remove and reseal the window properly if sealant failure is confirmed.",
+    "decision_tree": {
+      "q0": {
+        "yes": { "say": "Focus inspection on exterior window sealant and upper corners." },
+        "no": { "say": "Inspect interior condensation or plumbing sources near the window." }
+      },
+      "q2": {
+        "yes": { "say": "Previous installation work increases likelihood of improper sealing." },
+        "no": { "say": "Original factory sealant may have failed due to age." }
+      }
+    }
+  },
+  {
+    "title": "Soft or spongy floor near bathroom or entry",
+    "category": "Structural / Flooring",
+    "severity": "Critical",
+    "years_min": 2010,
+    "years_max": 2025,
+    "customer_summary": "The floor feels soft or spongy near the bathroom or entry area.",
+    "clarifying_questions": [
+      "Is the soft area near plumbing fixtures?",
+      "Has there been any known water leak or overflow?",
+      "Does the soft area extend beyond one foot?"
+    ],
+    "steps": [
+      "Stop using nearby plumbing fixtures.",
+      "Inspect under sinks and behind access panels.",
+      "Check for swelling or discoloration at floor seams.",
+      "Map the soft area by gentle pressure."
+    ],
+    "model_year_notes": [
+      "Subfloor damage often spreads beyond visible softness."
+    ],
+    "stop_and_escalate": [
+      "Floor feels unsafe to walk on",
+      "Water continues without use",
+      "Strong musty odor"
+    ],
+    "next_step": "Professional inspection is recommended to assess structural damage.",
+    "decision_tree": {
+      "q0": {
+        "yes": { "say": "Plumbing leaks are the most likely source." },
+        "no": { "say": "Inspect exterior door seals and nearby wall penetrations." }
+      }
+    }
+  },
+  {
+    "title": "Water leaking from roof vent or fan",
+    "category": "Water / Roof",
+    "severity": "High",
+    "years_min": 2010,
+    "years_max": 2025,
+    "customer_summary": "Water enters from the ceiling near a roof vent, fan, or skylight.",
+    "clarifying_questions": [
+      "Does the leak only occur during rain?",
+      "Is water visible at the ceiling opening?",
+      "Has the vent or fan ever been replaced?"
+    ],
+    "steps": [
+      "Inspect roof sealant around the vent or fan.",
+      "Check for loose or missing mounting screws.",
+      "Inspect ceiling trim for staining.",
+      "Verify water is not migrating from another roof penetration."
+    ],
+    "model_year_notes": [
+      "Sealant degradation is common after 5–8 years."
+    ],
+    "stop_and_escalate": [
+      "Water dripping from ceiling",
+      "Soft or sagging ceiling",
+      "Electrical exposure"
+    ],
+    "next_step": "Remove and reseal the vent or fan using approved materials.",
+    "decision_tree": {
+      "q0": {
+        "yes": { "say": "Roof penetration sealant failure is likely." },
+        "no": { "say": "Inspect for condensation or water migration from another penetration." }
+      }
+    }
+  },
+  {
+    "title": "Water leaking from marker or clearance lights",
+    "category": "Water / Exterior",
+    "severity": "High",
+    "years_min": 2010,
+    "years_max": 2025,
+    "customer_summary": "Water enters through marker or clearance lights and travels inside walls.",
+    "clarifying_questions": [
+      "Does the leak appear high on the wall?",
+      "Does it only happen during rain?",
+      "Has a marker light been replaced before?"
+    ],
+    "steps": [
+      "Inspect exterior marker lights for cracks.",
+      "Check sealant behind the light housing.",
+      "Test the fixture for movement.",
+      "Inspect interior wall below for staining."
+    ],
+    "model_year_notes": [
+      "Marker lights are one of the most common hidden leak sources."
+    ],
+    "stop_and_escalate": [
+      "Soft wall structure",
+      "Water running inside wall cavity"
+    ],
+    "next_step": "Remove and reseal the marker light properly.",
+    "decision_tree": {
+      "q0": {
+        "yes": { "say": "Marker light bedding failure is very likely." },
+        "no": { "say": "Inspect other high wall penetrations above the leak." }
+      }
+    }
+  },
+  {
+    "title": "Water leaking around entry door",
+    "category": "Water / Doors",
+    "severity": "High",
+    "years_min": 2010,
+    "years_max": 2025,
+    "customer_summary": "Water enters around the entry door frame during rain.",
+    "clarifying_questions": [
+      "Does water pool at the bottom of the door?",
+      "Is the door difficult to close tightly?",
+      "Has the door ever been adjusted or removed?"
+    ],
+    "steps": [
+      "Inspect exterior door frame sealant.",
+      "Check for frame movement or gaps.",
+      "Inspect threshold and weep areas.",
+      "Inspect interior wall and floor near door."
+    ],
+    "model_year_notes": [
+      "Door alignment shifts can break compression seals."
+    ],
+    "stop_and_escalate": [
+      "Soft floor at entry",
+      "Active water intrusion"
+    ],
+    "next_step": "Door assembly may need removal and resealing.",
+    "decision_tree": {
+      "q0": {
+        "yes": { "say": "Threshold or lower frame seal failure is likely." },
+        "no": { "say": "Inspect upper door frame corners for sealant failure." }
+      }
+    }
+  },
+
+  {
+    "title": "Water leaking from shower pan or base",
+    "category": "Water / Plumbing",
+    "severity": "Critical",
+    "years_min": 2010,
+    "years_max": 2025,
+    "customer_summary": "Water appears outside the shower during or after use.",
+    "clarifying_questions": [
+      "Does the leak only occur during shower use?",
+      "Is water visible at the shower curb or base?",
+      "Has the shower pan ever been repaired?"
+    ],
+    "steps": [
+      "Stop using the shower immediately.",
+      "Inspect pan seams and drain area.",
+      "Check wall-to-pan joints.",
+      "Inspect floor outside shower for softness."
+    ],
+    "model_year_notes": [
+      "Shower pan or drain failures cause rapid hidden damage."
+    ],
+    "stop_and_escalate": [
+      "Soft flooring near bathroom",
+      "Mold odor"
+    ],
+    "next_step": "Professional inspection is required.",
+    "decision_tree": {
+      "q0": {
+        "yes": { "say": "Shower pan or drain seal failure is likely." },
+        "no": { "say": "Inspect nearby plumbing lines and wall penetrations." }
+      }
+    }
+  },
+  {
+    "title": "Water leaking from front or rear shell seam",
+    "category": "Water / Body Seams",
+    "severity": "High",
+    "years_min": 2010,
+    "years_max": 2025,
+    "customer_summary": "Water enters through the front or rear shell seam and appears inside cabinets or curved panels.",
+    "clarifying_questions": [
+      "Does the leak occur after heavy rain?",
+      "Is the leak near the front or rear of the trailer?",
+      "Has seam sealant been serviced before?"
+    ],
+    "steps": [
+      "Inspect exterior shell seam for sealant gaps.",
+      "Check interior cabinets for staining.",
+      "Inspect curved interior panels for moisture.",
+      "Inspect roof penetrations above the seam."
+    ],
+    "model_year_notes": [
+      "Seam sealant separates over time."
+    ],
+    "stop_and_escalate": [
+      "Active water intrusion",
+      "Interior panel delamination"
+    ],
+    "next_step": "Shell seam resealing may be required.",
+    "decision_tree": {
+      "q0": {
+        "yes": { "say": "Front or rear seam sealant failure is likely." },
+        "no": { "say": "Inspect roof penetrations above seam area." }
+      }
+    }
+  },
+  {
+    "title": "Water leaking into exterior storage compartment",
+    "category": "Water / Compartments",
+    "severity": "Medium",
+    "years_min": 2010,
+    "years_max": 2025,
+    "customer_summary": "Water collects inside an exterior storage compartment after rain.",
+    "clarifying_questions": [
+      "Does water only appear after rain?",
+      "Does the hatch seal appear flattened or damaged?",
+      "Is water pooling at the bottom?"
+    ],
+    "steps": [
+      "Inspect hatch seal for damage.",
+      "Check frame sealant for gaps.",
+      "Clear blocked drain holes.",
+      "Inspect surrounding wall for moisture."
+    ],
+    "model_year_notes": [
+      "Hatch seals compress over time."
+    ],
+    "stop_and_escalate": [
+      "Water entering wall cavity"
+    ],
+    "next_step": "Replace hatch seal and reseal frame.",
+    "decision_tree": {
+      "q0": {
+        "yes": { "say": "Hatch seal compression failure is likely." },
+        "no": { "say": "Inspect nearby body seams and penetrations." }
+      }
+    }
+  },
+  {
+    "title": "Water leaking under sink or cabinet",
+    "category": "Water / Plumbing",
+    "severity": "High",
+    "years_min": 2010,
+    "years_max": 2025,
+    "customer_summary": "Water is found under a sink or inside a cabinet.",
+    "clarifying_questions": [
+      "Does the leak occur when the faucet is used?",
+      "Is the leak intermittent?",
+      "Has plumbing been serviced recently?"
+    ],
+    "steps": [
+      "Turn off water supply.",
+      "Inspect fittings and P-trap connections.",
+      "Dry area and recheck after brief use.",
+      "Inspect cabinetry for swelling."
+    ],
+    "model_year_notes": [
+      "Vibration can loosen fittings."
+    ],
+    "stop_and_escalate": [
+      "Persistent leaking",
+      "Cabinet or floor damage"
+    ],
+    "next_step": "Repair or replace leaking fittings.",
+    "decision_tree": {
+      "q0": {
+        "yes": { "say": "Plumbing connection leak is likely." },
+        "no": { "say": "Inspect nearby wall penetrations or drain lines." }
+      }
+    }
+  },
+  {
+    "title": "Water leaking from awning or roof rail mounts",
+    "category": "Water / Roof",
+    "severity": "High",
+    "years_min": 2010,
+    "years_max": 2025,
+    "customer_summary": "Water appears inside near windows below awning or roof rail mounts.",
+    "clarifying_questions": [
+      "Was the awning installed aftermarket?",
+      "Is staining visible below the mounts?",
+      "Does it leak only during rain?"
+    ],
+    "steps": [
+      "Inspect mounting screws for looseness.",
+      "Check sealant around brackets.",
+      "Inspect interior wall below mounts.",
+      "Inspect roof rail seam above."
+    ],
+    "model_year_notes": [
+      "Aftermarket installs are common leak sources."
+    ],
+    "stop_and_escalate": [
+      "Water entering wall cavity"
+    ],
+    "next_step": "Reseal or reinstall awning mounts.",
+    "decision_tree": {
+      "q0": {
+        "yes": { "say": "Awning mount penetration is a likely source." },
+        "no": { "say": "Inspect roof seam or rail above the area." }
+      }
+    }
+  },
+  {
+    "title": "Water leaking at city water inlet connection",
+    "category": "Water / Plumbing",
+    "severity": "High",
+    "years_min": 2010,
+    "years_max": 2025,
+    "customer_summary": "Water leaks at or behind the city water inlet when connected to a hose.",
+    "clarifying_questions": [
+      "Does the leak stop when water is disconnected?",
+      "Is the hose washer in good condition?",
+      "Is moisture visible inside near the inlet?"
+    ],
+    "steps": [
+      "Disconnect city water immediately.",
+      "Inspect hose gasket and inlet fitting.",
+      "Check inlet for cracks or looseness.",
+      "Inspect interior access area for leaks."
+    ],
+    "model_year_notes": [
+      "Check valves and plastic fittings can fail with age."
+    ],
+    "stop_and_escalate": [
+      "Water inside wall cavity"
+    ],
+    "next_step": "Replace inlet or check valve assembly.",
+    "decision_tree": {
+      "q0": {
+        "yes": { "say": "External hose or gasket issue is likely." },
+        "no": { "say": "Leak is likely behind the inlet and needs service." }
+      }
+    }
+  },
+  {
+    "title": "Water leaking from black tank flush connection",
+    "category": "Water / Plumbing",
+    "severity": "High",
+    "years_min": 2010,
+    "years_max": 2025,
+    "customer_summary": "Water leaks when using the black tank flush connection.",
+    "clarifying_questions": [
+      "Does the leak occur during flush use?",
+      "Is water visible in the rear compartment?",
+      "Has the flush fitting been serviced before?"
+    ],
+    "steps": [
+      "Stop using the black tank flush.",
+      "Inspect hose gasket and flush inlet.",
+      "Check flush line behind access panel.",
+      "Inspect for water entering the underbelly."
+    ],
+    "model_year_notes": [
+      "Flush fittings and check valves can fail or freeze-crack."
+    ],
+    "stop_and_escalate": [
+      "Water entering underbelly",
+      "Soft floor near bathroom"
+    ],
+    "next_step": "Repair or replace flush inlet or check valve.",
+    "decision_tree": {
+      "q0": {
+        "yes": { "say": "Flush inlet or check valve failure is likely." },
+        "no": { "say": "Inspect flush line routing behind the wall." }
+      }
+    }
+  },
+  {
+    "title": "Water dripping inside from A/C condensation",
+    "category": "Water / HVAC",
+    "severity": "Medium",
+    "years_min": 2010,
+    "years_max": 2025,
+    "customer_summary": "Water drips from the ceiling near the A/C during humid conditions without rain.",
+    "clarifying_questions": [
+      "Does this happen without any rain?",
+      "Does it occur during heavy A/C use?",
+      "Is the trailer level?"
+    ],
+    "steps": [
+      "Confirm dripping occurs during A/C operation without rain.",
+      "Inspect roof A/C area for debris blocking drainage.",
+      "Inspect interior A/C trim for pooled water.",
+      "Verify the trailer is level."
+    ],
+    "model_year_notes": [
+      "High humidity increases condensate volume."
+    ],
+    "stop_and_escalate": [
+      "Dripping near electrical fixtures",
+      "Ceiling swelling"
+    ],
+    "next_step": "A/C drainage or gasket service may be required.",
+    "decision_tree": {
+      "q0": {
+        "yes": { "say": "Condensation management issue is likely." },
+        "no": { "say": "Inspect roof sealant for possible rain intrusion." }
+      }
+    }
+  }
+]
