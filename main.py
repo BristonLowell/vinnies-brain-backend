@@ -1,19 +1,26 @@
 """
-MAIN.PY — Decision Tree + Step-by-step chat
+MAIN.PY — ChatGPT-style internal-only answers + optional guided decision-tree coaching
 
-IMPORTANT (do this in Supabase once, before deploying):
+What this version changes:
+- Default behavior is ChatGPT-like: retrieve internal sources (Supabase/Postgres) and call OpenAI to answer
+  using ONLY your internal sources (RAG).
+- Guided troubleshooting (clarify -> coach step-by-step) still exists, but only triggers when the user asks
+  for it (or you can expand triggers).
+
+IMPORTANT (Supabase once, before deploying):
 ------------------------------------------------------
+-- Ensure pgvector is enabled:
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- Your existing columns are fine; decision_tree already added by you:
 ALTER TABLE kb_articles
 ADD COLUMN IF NOT EXISTS decision_tree JSONB NOT NULL DEFAULT '{}'::jsonb;
-
-(You do NOT need to change your sessions table for this version.)
 """
 
 import os
 import uuid
 import json
 import smtplib
-import re
 import traceback
 from contextlib import contextmanager
 from email.message import EmailMessage
@@ -28,24 +35,46 @@ from fastapi.requests import Request
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
-from openai_client import embed_text, generate_answer  # you already have these
+from openai_client import embed_text, generate_answer  # uses your provided openai_client.py
 
 load_dotenv()
 
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
-    "postgresql://postgres:postgres@localhost:5432/vinniesbrain"
+    "postgresql://postgres:postgres@localhost:5432/vinniesbrain",
 )
 ESCALATION_EMAIL = os.getenv("ESCALATION_EMAIL", "bristonlowell@gmail.com")
 
-TOP_K = int(os.getenv("TOP_K", "5"))
+TOP_K = int(os.getenv("TOP_K", "8"))
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.55"))
 
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
+
+# You can keep your long system prompt here if you like.
 SYSTEM_PROMPT = """You are “Vinnie’s Brain,” a customer-first troubleshooting assistant for Airstream trailers from model years 2010–2025.
-... (unchanged) ...
+You help users diagnose issues safely and clearly.
 """
 
-app = FastAPI(title="Vinnie's Brain API", version="0.1.0")
+# NEW: internal-only answer mode prompt
+INTERNAL_ONLY_PROMPT = """
+You are Vinnie’s Brain.
+
+You MUST answer using ONLY the provided INTERNAL SOURCES.
+Do not use outside knowledge. Do not mention browsing the internet.
+If the sources do not contain the answer, say exactly:
+"I don’t have that in our knowledge base yet."
+
+Then ask 1–2 clarifying questions that would help find the right internal article.
+
+Rules:
+- Be natural and conversational (like ChatGPT).
+- Keep answers practical and concise.
+- If you recommend steps, list them clearly.
+- If safety risk is detected (water intrusion, soft floor/wall, mold, electrical), include a short safety warning and recommend escalation.
+- Cite sources like: [source:<id>] after the sentence that uses it.
+""".strip()
+
+app = FastAPI(title="Vinnie's Brain API", version="0.2.0")
 
 
 # -------------------------
@@ -130,9 +159,6 @@ def session_exists(session_id: str):
 # -------------------------
 # Models
 # -------------------------
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
-
-
 class AdminArticleUpsertRequest(BaseModel):
     id: Optional[str] = None
     title: str
@@ -146,8 +172,6 @@ class AdminArticleUpsertRequest(BaseModel):
     model_year_notes: List[str] = []
     stop_and_escalate: List[str] = []
     next_step: str
-
-    # NEW: decision tree per article
     decision_tree: Dict[str, Any] = {}
 
 
@@ -155,11 +179,8 @@ class CreateSessionRequest(BaseModel):
     channel: str = "mobile"
     mode: str = Field(default="customer", pattern="^(customer|staff)$")
 
-    # NEW (for "start over each app open"):
-    # If provided, we will reset this old session before creating a new one.
+    # reset-old-session support (unchanged)
     reset_old_session_id: Optional[str] = None
-
-    # If true, delete all messages from the old session as well (default true).
     delete_old_messages: bool = True
 
 
@@ -226,19 +247,21 @@ def require_admin(x_admin_key: str | None):
 
 
 def make_retrieval_text_from_admin(a: AdminArticleUpsertRequest) -> str:
-    return "\n".join([
-        f"Title: {a.title}",
-        f"Category: {a.category}",
-        f"Severity: {a.severity}",
-        f"Applies: {a.years_min}-{a.years_max}",
-        f"Summary: {a.customer_summary}",
-        "Clarifying Questions: " + " | ".join(a.clarifying_questions),
-        "Steps: " + " | ".join(a.steps),
-        "Model Year Notes: " + " | ".join(a.model_year_notes),
-        "Stop & Escalate: " + " | ".join(a.stop_and_escalate),
-        f"Next Step: {a.next_step}",
-        # decision_tree is operational logic, not required in retrieval_text
-    ])
+    return "\n".join(
+        [
+            f"Title: {a.title}",
+            f"Category: {a.category}",
+            f"Severity: {a.severity}",
+            f"Applies: {a.years_min}-{a.years_max}",
+            f"Summary: {a.customer_summary}",
+            "Clarifying Questions: " + " | ".join(a.clarifying_questions),
+            "Steps: " + " | ".join(a.steps),
+            "Model Year Notes: " + " | ".join(a.model_year_notes),
+            "Stop & Escalate: " + " | ".join(a.stop_and_escalate),
+            f"Next Step: {a.next_step}",
+            # decision_tree is operational logic, not required in retrieval_text
+        ]
+    )
 
 
 @app.post("/v1/admin/kb/upsert")
@@ -284,8 +307,11 @@ def admin_kb_upsert(
             """,
             (
                 article_id,
-                req.title, req.category, req.severity,
-                req.years_min, req.years_max,
+                req.title,
+                req.category,
+                req.severity,
+                req.years_min,
+                req.years_max,
                 req.customer_summary,
                 json.dumps(req.clarifying_questions),
                 json.dumps(req.steps),
@@ -346,22 +372,19 @@ def set_triage_state(conn, session_id: str, state: dict):
 
 
 # -------------------------
-# NEW: Reset session server-side (used by mobile "start over on open")
+# Reset session server-side (used by mobile "start over on open")
 # -------------------------
 def reset_existing_session(conn, session_id: str, delete_messages: bool = True) -> None:
-    # If it doesn't exist, silently ignore (mobile apps can be messy)
     row = exec_one(conn, "SELECT id FROM sessions WHERE id=%s", (session_id,))
     if not row:
         return
 
-    # Clear state/context
     exec_no_return(
         conn,
         "UPDATE sessions SET triage_state='{}'::jsonb, airstream_year=NULL, category=NULL WHERE id=%s",
         (session_id,),
     )
 
-    # Optionally delete prior messages (so it truly starts fresh)
     if delete_messages:
         exec_no_return(conn, "DELETE FROM messages WHERE session_id=%s", (session_id,))
 
@@ -370,7 +393,7 @@ def reset_existing_session(conn, session_id: str, delete_messages: bool = True) 
 # Helpers
 # -------------------------
 def detect_safety_flags(user_text: str) -> List[str]:
-    t = user_text.lower()
+    t = (user_text or "").lower()
     flags = []
     if any(k in t for k in ["active drip", "dripping", "running water", "pouring in"]):
         flags.append("active_water_intrusion")
@@ -384,12 +407,6 @@ def detect_safety_flags(user_text: str) -> List[str]:
 
 
 def json_list(val) -> list:
-    """
-    Handles JSONB returned as:
-      - Python list (ideal)
-      - JSON string like '["a","b"]' (older rows)
-      - None
-    """
     if val is None:
         return []
     if isinstance(val, list):
@@ -417,15 +434,27 @@ def parse_yes_no(text: str):
     return None
 
 
+def wants_guided_mode(text: str) -> bool:
+    t = (text or "").lower()
+    triggers = [
+        "walk me through",
+        "step by step",
+        "guide me",
+        "troubleshoot",
+        "diagnose",
+        "help me fix",
+        "how do i fix",
+        "what should i do next",
+    ]
+    return any(x in t for x in triggers)
+
+
 def format_clarify(q_index: int, total: int, question: str) -> str:
     return f"Quick question ({q_index+1}/{total}): {question}"
 
 
 def format_step(step_index: int, total: int, step_text: str) -> str:
-    return (
-        f"Step {step_index+1}/{total}: {step_text}\n\n"
-        "What did you find / what changed?"
-    )
+    return f"Step {step_index+1}/{total}: {step_text}\n\nWhat did you find / what changed?"
 
 
 # -------------------------
@@ -435,7 +464,7 @@ def retrieve_articles(
     conn,
     query_embedding: List[float],
     airstream_year: Optional[int],
-    top_k: int
+    top_k: int,
 ) -> List[Tuple[Dict[str, Any], float]]:
     if airstream_year is not None:
         sql = """
@@ -469,19 +498,42 @@ def retrieve_articles(
     return [(r, float(r["score"])) for r in rows]
 
 
+def build_sources_context(rows: List[Tuple[Dict[str, Any], float]]) -> Tuple[str, List[Dict[str, Any]], float]:
+    if not rows:
+        return "", [], 0.0
+
+    top_score = rows[0][1]
+    used_articles = [{"id": r[0]["id"], "title": r[0]["title"]} for r in rows]
+
+    parts = []
+    for (a, score) in rows:
+        parts.append(
+            "\n".join(
+                [
+                    f"ID: {a.get('id')}",
+                    f"Title: {a.get('title')}",
+                    f"Category: {a.get('category')}",
+                    f"Years: {a.get('years_min')}-{a.get('years_max')}",
+                    f"Summary: {a.get('customer_summary')}",
+                    f"Clarifying Questions: {json.dumps(json_list(a.get('clarifying_questions')))}",
+                    f"Steps: {json.dumps(json_list(a.get('steps')))}",
+                    f"Model Year Notes: {json.dumps(json_list(a.get('model_year_notes')))}",
+                    f"Stop & Escalate: {json.dumps(json_list(a.get('stop_and_escalate')))}",
+                    f"Next Step: {a.get('next_step')}",
+                    f"(relevance_score={score:.3f})",
+                ]
+            )
+        )
+
+    context_text = "INTERNAL SOURCES:\n\n" + "\n\n---\n\n".join(parts)
+    return context_text, used_articles, float(top_score)
+
+
 # -------------------------
 # Routes
 # -------------------------
 @app.post("/v1/sessions", response_model=CreateSessionResponse)
 def create_session(req: CreateSessionRequest):
-    """
-    Creates a new session.
-
-    NEW behavior:
-    - If req.reset_old_session_id is provided, we reset that old session
-      (clear triage_state, clear context, optionally delete messages)
-      BEFORE creating a fresh session_id.
-    """
     sid = str(uuid.uuid4())
     with db() as conn:
         if req.reset_old_session_id:
@@ -516,22 +568,20 @@ def chat(req: ChatRequest):
         insert_message(conn, req.session_id, "user", req.message)
 
         year = req.airstream_year or sess.get("airstream_year")
-        safety_flags = detect_safety_flags(req.message)
-
-        state = get_triage_state(conn, req.session_id) or {}
         user_text = (req.message or "").strip()
+        safety_flags = detect_safety_flags(user_text)
         user_skip = user_text.lower() in ("skip", "skip question", "not sure", "idk", "unsure")
 
-        # Escalate if safety flags are present
-        show_escalation = any(
-            f in safety_flags
-            for f in ["active_water_intrusion", "structural_moisture_risk", "mold_risk", "electrical_risk"]
-        )
+        state = get_triage_state(conn, req.session_id) or {}
 
         # ---------------------------------------------------------
-        # A) COACH MODE: return ONE step at a time
+        # A) COACH MODE: return ONE step at a time (unchanged)
         # ---------------------------------------------------------
         if state.get("stage") == "coach":
+            show_escalation = any(
+                f in safety_flags
+                for f in ["active_water_intrusion", "structural_moisture_risk", "mold_risk", "electrical_risk"]
+            )
             if show_escalation:
                 answer = (
                     "Before we continue: this could involve a safety risk.\n\n"
@@ -614,10 +664,7 @@ def chat(req: ChatRequest):
             )
 
         # ---------------------------------------------------------
-        # B) CLARIFY MODE: ask ONE question at a time
-        # NEW: if user answers YES/NO and decision_tree has a mapped action,
-        #      immediately return the correct troubleshooting step (as Step 1),
-        #      then continue in coach mode one step at a time.
+        # B) CLARIFY MODE: ask ONE question at a time + decision_tree injection (unchanged)
         # ---------------------------------------------------------
         if state.get("stage") == "clarify":
             questions = state.get("questions", [])
@@ -753,18 +800,20 @@ def chat(req: ChatRequest):
             )
 
         # ---------------------------------------------------------
-        # C) NORMAL START: retrieve and decide clarify vs coach
+        # C) DEFAULT MODE: retrieve -> ChatGPT-like internal-only answer
         # ---------------------------------------------------------
         q_emb = embed_text(user_text)
         retrieved = retrieve_articles(conn, q_emb, year, top_k=TOP_K)
+        sources_text, used_articles, top_score = build_sources_context(retrieved)
         articles = [r[0] for r in retrieved]
-        top_score = retrieved[0][1] if retrieved else 0.0
 
+        # If nothing relevant, ask clarifiers first (do NOT escalate by default)
         if top_score < CONFIDENCE_THRESHOLD or not articles:
             answer = (
-                "I don’t have a verified Airstream-specific answer for that yet in Vinnie’s Brain.\n\n"
-                f"Because this could involve hidden damage or safety risk, please contact us at {ESCALATION_EMAIL} "
-                "and include your Airstream year, where the issue is happening, and when it occurs (rain/washing/travel)."
+                "I don’t have that in our knowledge base yet.\n\n"
+                "Quick questions so I can find the right internal article:\n"
+                "1) What Airstream year is it?\n"
+                "2) Where is the issue happening (roof/window/plumbing bay/underbelly/interior appliance)?\n"
             )
             msg_id = insert_message(conn, req.session_id, "assistant", answer, used_articles=[], confidence=top_score)
             conn.commit()
@@ -774,83 +823,92 @@ def chat(req: ChatRequest):
                 safety_flags=safety_flags,
                 confidence=top_score,
                 used_articles=[],
-                show_escalation=True,
+                show_escalation=False,
                 message_id=msg_id,
             )
 
-        top_article = articles[0]
-        qs = json_list(top_article.get("clarifying_questions"))[:3]
-        steps = json_list(top_article.get("steps"))
-        stop_escalate = json_list(top_article.get("stop_and_escalate"))
-        decision_tree = top_article.get("decision_tree") or {}
+        # If user wants guided troubleshooting, enter your guided flow using the top article
+        if wants_guided_mode(user_text):
+            top_article = articles[0]
+            qs = json_list(top_article.get("clarifying_questions"))[:3]
+            steps = json_list(top_article.get("steps"))
+            stop_escalate = json_list(top_article.get("stop_and_escalate"))
+            decision_tree = top_article.get("decision_tree") or {}
 
-        if qs:
-            new_state = {
-                "stage": "clarify",
+            if qs:
+                new_state = {
+                    "stage": "clarify",
+                    "article_id": top_article.get("id"),
+                    "article_title": top_article.get("title"),
+                    "original_issue": user_text,
+                    "questions": qs,
+                    "q_index": 0,
+                    "answers": {},
+                    "base_steps": steps,
+                    "next_step": top_article.get("next_step"),
+                    "stop_and_escalate": stop_escalate,
+                    "decision_tree": decision_tree,
+                }
+                set_triage_state(conn, req.session_id, new_state)
+
+                first_q = qs[0]
+                assistant_text = format_clarify(0, len(qs), first_q)
+                msg_id = insert_message(conn, req.session_id, "assistant", assistant_text, used_articles=[], confidence=top_score)
+                conn.commit()
+
+                return ChatResponse(
+                    answer=assistant_text,
+                    clarifying_questions=[first_q],
+                    safety_flags=safety_flags,
+                    confidence=top_score,
+                    used_articles=[],
+                    show_escalation=False,
+                    message_id=msg_id,
+                )
+
+            coach_state = {
+                "stage": "coach",
                 "article_id": top_article.get("id"),
                 "article_title": top_article.get("title"),
                 "original_issue": user_text,
-                "questions": qs,
-                "q_index": 0,
-                "answers": {},
-                "base_steps": steps,
+                "steps": steps,
+                "step_index": 0,
                 "next_step": top_article.get("next_step"),
                 "stop_and_escalate": stop_escalate,
-                "decision_tree": decision_tree,
             }
-            set_triage_state(conn, req.session_id, new_state)
-
-            first_q = qs[0]
-            assistant_text = format_clarify(0, len(qs), first_q)
-            msg_id = insert_message(conn, req.session_id, "assistant", assistant_text, used_articles=[], confidence=top_score)
-            conn.commit()
-
-            return ChatResponse(
-                answer=assistant_text,
-                clarifying_questions=[first_q],
-                safety_flags=safety_flags,
-                confidence=top_score,
-                used_articles=[],
-                show_escalation=False,
-                message_id=msg_id,
-            )
-
-        coach_state = {
-            "stage": "coach",
-            "article_id": top_article.get("id"),
-            "article_title": top_article.get("title"),
-            "original_issue": user_text,
-            "steps": steps,
-            "step_index": 0,
-            "next_step": top_article.get("next_step"),
-            "stop_and_escalate": stop_escalate,
-        }
-        set_triage_state(conn, req.session_id, coach_state)
-
-        if steps:
-            first = format_step(0, len(steps), steps[0])
-            coach_state["step_index"] = 1
             set_triage_state(conn, req.session_id, coach_state)
 
-            used_articles = [{"id": top_article["id"], "title": top_article["title"]}]
-            msg_id = insert_message(conn, req.session_id, "assistant", first, used_articles=used_articles, confidence=top_score)
-            conn.commit()
+            if steps:
+                first = format_step(0, len(steps), steps[0])
+                coach_state["step_index"] = 1
+                set_triage_state(conn, req.session_id, coach_state)
 
-            return ChatResponse(
-                answer=first,
-                clarifying_questions=[],
-                safety_flags=safety_flags,
-                confidence=top_score,
-                used_articles=[UsedArticle(**ua) for ua in used_articles],
-                show_escalation=False,
-                message_id=msg_id,
-            )
+                used_one = [{"id": top_article["id"], "title": top_article["title"]}]
+                msg_id = insert_message(conn, req.session_id, "assistant", first, used_articles=used_one, confidence=top_score)
+                conn.commit()
 
-        answer = (
-            f"{top_article.get('customer_summary')}\n\n"
-            "Quick question: does this happen after rain/washing, or after using the water system?"
+                return ChatResponse(
+                    answer=first,
+                    clarifying_questions=[],
+                    safety_flags=safety_flags,
+                    confidence=top_score,
+                    used_articles=[UsedArticle(**ua) for ua in used_one],
+                    show_escalation=False,
+                    message_id=msg_id,
+                )
+
+        # Otherwise: ChatGPT-style answer using ONLY internal sources
+        answer = generate_answer(
+            system_prompt=INTERNAL_ONLY_PROMPT,
+            kb_context=sources_text,
+            user_message=user_text,
         )
-        used_articles = [{"id": top_article["id"], "title": top_article["title"]}]
+
+        show_escalation = any(
+            f in safety_flags
+            for f in ["active_water_intrusion", "structural_moisture_risk", "mold_risk", "electrical_risk"]
+        )
+
         msg_id = insert_message(conn, req.session_id, "assistant", answer, used_articles=used_articles, confidence=top_score)
         conn.commit()
 
@@ -860,7 +918,7 @@ def chat(req: ChatRequest):
             safety_flags=safety_flags,
             confidence=top_score,
             used_articles=[UsedArticle(**ua) for ua in used_articles],
-            show_escalation=False,
+            show_escalation=show_escalation,
             message_id=msg_id,
         )
 

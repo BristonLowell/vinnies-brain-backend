@@ -1,3 +1,5 @@
+# openai_client.py (paste this whole file as-is)
+
 import os
 from typing import List
 from dotenv import load_dotenv
