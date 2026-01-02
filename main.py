@@ -148,17 +148,19 @@ class AdminArticleUpsertRequest(BaseModel):
     next_step: str
 
     # NEW: decision tree per article
-    # Expected shape example:
-    # {
-    #   "q0": {"yes": {"say": "Do X"}, "no": {"say": "Do Y"}},
-    #   "q1": {"yes": {"say": "..."}, "no": {"say": "..."}}
-    # }
     decision_tree: Dict[str, Any] = {}
 
 
 class CreateSessionRequest(BaseModel):
     channel: str = "mobile"
     mode: str = Field(default="customer", pattern="^(customer|staff)$")
+
+    # NEW (for "start over each app open"):
+    # If provided, we will reset this old session before creating a new one.
+    reset_old_session_id: Optional[str] = None
+
+    # If true, delete all messages from the old session as well (default true).
+    delete_old_messages: bool = True
 
 
 class CreateSessionResponse(BaseModel):
@@ -344,6 +346,27 @@ def set_triage_state(conn, session_id: str, state: dict):
 
 
 # -------------------------
+# NEW: Reset session server-side (used by mobile "start over on open")
+# -------------------------
+def reset_existing_session(conn, session_id: str, delete_messages: bool = True) -> None:
+    # If it doesn't exist, silently ignore (mobile apps can be messy)
+    row = exec_one(conn, "SELECT id FROM sessions WHERE id=%s", (session_id,))
+    if not row:
+        return
+
+    # Clear state/context
+    exec_no_return(
+        conn,
+        "UPDATE sessions SET triage_state='{}'::jsonb, airstream_year=NULL, category=NULL WHERE id=%s",
+        (session_id,),
+    )
+
+    # Optionally delete prior messages (so it truly starts fresh)
+    if delete_messages:
+        exec_no_return(conn, "DELETE FROM messages WHERE session_id=%s", (session_id,))
+
+
+# -------------------------
 # Helpers
 # -------------------------
 def detect_safety_flags(user_text: str) -> List[str]:
@@ -451,8 +474,19 @@ def retrieve_articles(
 # -------------------------
 @app.post("/v1/sessions", response_model=CreateSessionResponse)
 def create_session(req: CreateSessionRequest):
+    """
+    Creates a new session.
+
+    NEW behavior:
+    - If req.reset_old_session_id is provided, we reset that old session
+      (clear triage_state, clear context, optionally delete messages)
+      BEFORE creating a fresh session_id.
+    """
     sid = str(uuid.uuid4())
     with db() as conn:
+        if req.reset_old_session_id:
+            reset_existing_session(conn, req.reset_old_session_id, delete_messages=req.delete_old_messages)
+
         exec_no_return(
             conn,
             "INSERT INTO sessions (id, mode, channel) VALUES (%s, %s, %s)",
@@ -587,17 +621,14 @@ def chat(req: ChatRequest):
         # ---------------------------------------------------------
         if state.get("stage") == "clarify":
             questions = state.get("questions", [])
-            q_index = int(state.get("q_index", 0))  # which question we are currently on
+            q_index = int(state.get("q_index", 0))
             answers = state.get("answers", {}) or {}
 
-            # Store answer for the current question (q_index)
             if not user_skip and q_index < len(questions):
                 answers[str(q_index)] = user_text
 
-            # --- DECISION TREE HANDLING ---
-            # We look at q{q_index} because that is the question the user just answered.
             yn = parse_yes_no(user_text)
-            decision_tree = state.get("decision_tree") or {}  # dict
+            decision_tree = state.get("decision_tree") or {}
             node = decision_tree.get(f"q{q_index}") if isinstance(decision_tree, dict) else None
 
             if yn in ("yes", "no") and isinstance(node, dict):
@@ -605,8 +636,7 @@ def chat(req: ChatRequest):
                 say = action.get("say")
 
                 if isinstance(say, str) and say.strip():
-                    # Transition immediately to COACH mode, injecting the decision step first
-                    base_steps = state.get("base_steps", [])  # we store generic steps here when starting clarify
+                    base_steps = state.get("base_steps", [])
                     if not isinstance(base_steps, list):
                         base_steps = []
 
@@ -645,7 +675,6 @@ def chat(req: ChatRequest):
                         message_id=msg_id,
                     )
 
-            # If no decision mapping fired, proceed to the NEXT clarifying question
             q_index += 1
             state["answers"] = answers
             state["q_index"] = q_index
@@ -668,7 +697,6 @@ def chat(req: ChatRequest):
                     message_id=msg_id,
                 )
 
-            # Clarification done -> start coach mode with the article's steps
             steps = state.get("base_steps", [])
             if not isinstance(steps, list):
                 steps = []
@@ -756,7 +784,6 @@ def chat(req: ChatRequest):
         stop_escalate = json_list(top_article.get("stop_and_escalate"))
         decision_tree = top_article.get("decision_tree") or {}
 
-        # Start clarify flow (store decision_tree + base_steps so we can inject later)
         if qs:
             new_state = {
                 "stage": "clarify",
@@ -788,7 +815,6 @@ def chat(req: ChatRequest):
                 message_id=msg_id,
             )
 
-        # Otherwise start coach mode immediately
         coach_state = {
             "stage": "coach",
             "article_id": top_article.get("id"),
