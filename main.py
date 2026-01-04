@@ -1,10 +1,8 @@
 import os
 import uuid
 import json
-import smtplib
 import traceback
 from contextlib import contextmanager
-from email.message import EmailMessage
 from typing import List, Optional, Dict, Any, Tuple
 
 import psycopg
@@ -28,14 +26,11 @@ TOP_K = int(os.getenv("TOP_K", "8"))
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.55"))
 WEB_RESULTS_K = int(os.getenv("WEB_RESULTS_K", "5"))
 
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
-
 SYSTEM_PROMPT = """You are “Vinnie’s Brain,” a helpful assistant for customers and staff.
 You can answer general questions normally.
 For Airstream troubleshooting questions, prioritize safety and clarity.
 """
 
-# KB-only prompt (STRICT)
 KB_ONLY_PROMPT = """
 You are Vinnie’s Brain.
 
@@ -49,7 +44,6 @@ Rules:
 Cite internal sources like: [kb:<id>]
 """.strip()
 
-# Web fallback prompt (STRICT)
 WEB_FALLBACK_PROMPT = """
 You are Vinnie’s Brain.
 
@@ -67,7 +61,7 @@ If you use web sources, include this line near the top:
 Cite web sources like: [web:<n>]
 """.strip()
 
-app = FastAPI(title="Vinnie's Brain API", version="0.3.2")
+app = FastAPI(title="Vinnie's Brain API", version="0.3.4")
 
 
 # -------------------------
@@ -239,23 +233,6 @@ def detect_safety_flags(user_text: str) -> List[str]:
     return flags
 
 
-def json_list(val) -> list:
-    if val is None:
-        return []
-    if isinstance(val, list):
-        return val
-    if isinstance(val, str):
-        s = val.strip()
-        if not s:
-            return []
-        try:
-            parsed = json.loads(s)
-            return parsed if isinstance(parsed, list) else []
-        except Exception:
-            return []
-    return []
-
-
 def is_greeting(text: str) -> bool:
     t = (text or "").strip().lower()
     return t in {
@@ -293,6 +270,51 @@ def parse_yes_no(text: str) -> Optional[str]:
 def is_simple_followup(text: str) -> bool:
     t = (text or "").strip().lower()
     return parse_yes_no(t) in {"yes", "no"} or t in {"skip", "not sure", "unsure", "idk"}
+
+
+def should_show_help_for_airstream(airstreamish: bool, safety: bool, confidence: float, web_mode: bool = False) -> bool:
+    # ✅ ONLY show help button for Airstream issues
+    if not airstreamish:
+        return False
+    return safety or web_mode or (confidence < CONFIDENCE_THRESHOLD)
+
+
+def enforce_one_question(answer: str) -> Tuple[str, List[str]]:
+    a = (answer or "").strip()
+    if "?" not in a:
+        return a, []
+    first_q = a[: a.find("?") + 1].strip()
+
+    lower = a.lower()
+    if "includes information from the web" in lower:
+        lines = [ln.strip() for ln in a.splitlines() if ln.strip()]
+        note_line = None
+        for ln in lines[:3]:
+            if "includes information from the web" in ln.lower():
+                note_line = ln
+                break
+        if note_line and note_line not in first_q:
+            forced = note_line + "\n\n" + first_q
+            return forced, [first_q]
+
+    return first_q, [first_q]
+
+
+def json_list(val) -> list:
+    if val is None:
+        return []
+    if isinstance(val, list):
+        return val
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return []
+        try:
+            parsed = json.loads(s)
+            return parsed if isinstance(parsed, list) else []
+        except Exception:
+            return []
+    return []
 
 
 def build_kb_sources_context(rows: List[Tuple[Dict[str, Any], float]]) -> Tuple[str, List[Dict[str, Any]], float]:
@@ -342,33 +364,6 @@ def build_web_context(results: List[Dict[str, Any]]) -> str:
             )
         )
     return "WEB SOURCES:\n\n" + "\n\n---\n\n".join(parts)
-
-
-def enforce_one_question(answer: str) -> Tuple[str, List[str]]:
-    """
-    If the model output includes any question marks, we force it to ask ONLY ONE question
-    and return ONLY that single question (no info dump).
-    Returns: (answer_text, [single_question] or [])
-    """
-    a = (answer or "").strip()
-    if "?" not in a:
-        return a, []
-
-    first_q = a[: a.find("?") + 1].strip()
-
-    lower = a.lower()
-    if "includes information from the web" in lower:
-        lines = [ln.strip() for ln in a.splitlines() if ln.strip()]
-        note_line = None
-        for ln in lines[:3]:
-            if "includes information from the web" in ln.lower():
-                note_line = ln
-                break
-        if note_line and note_line not in first_q:
-            forced = note_line + "\n\n" + first_q
-            return forced, [first_q]
-
-    return first_q, [first_q]
 
 
 # -------------------------
@@ -424,39 +419,6 @@ def session_exists(session_id: str):
         return {"ok": True}
 
 
-def reset_existing_session(conn, session_id: str, delete_messages: bool = True) -> None:
-    row = exec_one(conn, "SELECT id FROM sessions WHERE id=%s", (session_id,))
-    if not row:
-        return
-    exec_no_return(
-        conn,
-        "UPDATE sessions SET triage_state='{}'::jsonb, airstream_year=NULL, category=NULL WHERE id=%s",
-        (session_id,),
-    )
-    if delete_messages:
-        exec_no_return(conn, "DELETE FROM messages WHERE session_id=%s", (session_id,))
-
-
-@app.post("/v1/sessions", response_model=CreateSessionResponse)
-def create_session(req: CreateSessionRequest):
-    sid = str(uuid.uuid4())
-    with db() as conn:
-        if req.reset_old_session_id:
-            reset_existing_session(conn, req.reset_old_session_id, delete_messages=req.delete_old_messages)
-        exec_no_return(conn, "INSERT INTO sessions (id, mode, channel) VALUES (%s, %s, %s)", (sid, req.mode, req.channel))
-        conn.commit()
-    return CreateSessionResponse(session_id=sid)
-
-
-@app.post("/v1/sessions/{session_id}/context")
-def update_context(session_id: str, req: UpdateContextRequest):
-    with db() as conn:
-        _ = get_session(conn, session_id)
-        exec_no_return(conn, "UPDATE sessions SET airstream_year=%s, category=%s WHERE id=%s", (req.airstream_year, req.category, session_id))
-        conn.commit()
-    return {"ok": True}
-
-
 @app.post("/v1/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
     with db() as conn:
@@ -466,12 +428,7 @@ def chat(req: ChatRequest):
         year = req.airstream_year or sess.get("airstream_year")
         user_text = (req.message or "").strip()
 
-        safety_flags = detect_safety_flags(user_text)
-        show_escalation = any(
-            f in safety_flags for f in ["active_water_intrusion", "structural_moisture_risk", "mold_risk", "electrical_risk"]
-        )
-
-        # Friendly greeting behavior
+        # Greeting
         if is_greeting(user_text):
             answer = "Hi 👋 What can I help with?"
             msg_id = insert_message(conn, req.session_id, "assistant", answer, used_articles=[], confidence=1.0)
@@ -486,7 +443,14 @@ def chat(req: ChatRequest):
                 safety_flags=[],
             )
 
-        # ✅ Cached web follow-up (DO NOT rerun web_search)
+        airstreamish = is_airstream_question(user_text, year)
+
+        safety_flags = detect_safety_flags(user_text) if airstreamish else []
+        safety_escalation = any(
+            f in safety_flags for f in ["active_water_intrusion", "structural_moisture_risk", "mold_risk", "electrical_risk"]
+        )
+
+        # Cached web follow-up (no web_search)
         state = get_triage_state(conn, req.session_id) or {}
         if state.get("web_followup_active") and is_simple_followup(user_text):
             cached_combined = state.get("cached_combined_context") or ""
@@ -500,10 +464,8 @@ def chat(req: ChatRequest):
                 kb_context=cached_combined + "\n\nCONVERSATION:\n" + conversation,
                 user_message=user_text,
             )
-
             answer, clarifying = enforce_one_question(raw)
 
-            # Stay in follow-up mode only if we asked another question
             if clarifying:
                 state["web_followup_active"] = True
                 state["last_clarifying_question"] = clarifying[0]
@@ -518,19 +480,17 @@ def chat(req: ChatRequest):
                 answer=answer,
                 confidence=cached_conf,
                 used_articles=[UsedArticle(**ua) for ua in cached_used] if cached_used else [],
-                show_escalation=show_escalation,
+                show_escalation=should_show_help_for_airstream(airstreamish, safety_escalation, cached_conf, web_mode=True),
                 message_id=msg_id,
                 clarifying_questions=clarifying,
                 safety_flags=safety_flags,
             )
 
-        airstreamish = is_airstream_question(user_text, year)
-
-        # If user sends a new (non-followup) message, clear cached web follow-up
+        # If new message, clear cached follow-up
         if state.get("web_followup_active") and not is_simple_followup(user_text):
             set_triage_state(conn, req.session_id, {})
 
-        # 1) Non-Airstream: answer normally, but keep it short and single-question-safe
+        # Non-Airstream: normal answer, NEVER show Request Help
         if not airstreamish:
             conversation = format_conversation(conn, req.session_id, limit=18)
             raw = generate_answer(
@@ -539,19 +499,20 @@ def chat(req: ChatRequest):
                 user_message=user_text,
             )
             answer, clarifying = enforce_one_question(raw)
-            msg_id = insert_message(conn, req.session_id, "assistant", answer, used_articles=[], confidence=0.85)
+            conf = 0.85
+            msg_id = insert_message(conn, req.session_id, "assistant", answer, used_articles=[], confidence=conf)
             conn.commit()
             return ChatResponse(
                 answer=answer,
-                confidence=0.85,
+                confidence=conf,
                 used_articles=[],
                 show_escalation=False,
                 message_id=msg_id,
                 clarifying_questions=clarifying,
-                safety_flags=safety_flags,
+                safety_flags=[],
             )
 
-        # 2) Airstream-related: KB first
+        # Airstream: KB first
         q_emb = embed_text(user_text)
         retrieved = retrieve_articles(conn, q_emb, year, top_k=TOP_K)
         kb_context, used_articles, kb_score = build_kb_sources_context(retrieved)
@@ -564,19 +525,20 @@ def chat(req: ChatRequest):
                 user_message=user_text,
             )
             answer, clarifying = enforce_one_question(raw)
+
             msg_id = insert_message(conn, req.session_id, "assistant", answer, used_articles=used_articles, confidence=kb_score)
             conn.commit()
             return ChatResponse(
                 answer=answer,
                 confidence=kb_score,
                 used_articles=[UsedArticle(**ua) for ua in used_articles],
-                show_escalation=show_escalation,
+                show_escalation=should_show_help_for_airstream(True, safety_escalation, kb_score, web_mode=False),
                 message_id=msg_id,
                 clarifying_questions=clarifying,
                 safety_flags=safety_flags,
             )
 
-        # 3) KB not confident -> Web fallback (clearly labeled + low confidence)
+        # Airstream: web fallback
         web_results: List[Dict[str, Any]] = []
         try:
             web_results = web_search(f"Airstream {year or ''} {user_text}".strip(), max_results=WEB_RESULTS_K)
@@ -604,7 +566,6 @@ def chat(req: ChatRequest):
             user_message=user_text,
         )
 
-        # Force disclaimer if model forgets
         disclaimer = "Note: This answer includes information from the web, not from Vinnie’s Brain. Confidence: Low."
         if "includes information from the web" not in (raw or "").lower():
             raw = disclaimer + "\n\n" + (raw or "")
@@ -612,12 +573,11 @@ def chat(req: ChatRequest):
         answer, clarifying = enforce_one_question(raw)
         confidence = 0.35
 
-        # ✅ Cache web context ONLY if we asked a follow-up question
         if clarifying:
             set_triage_state(conn, req.session_id, {
                 "web_followup_active": True,
                 "cached_combined_context": combined_context,
-                "cached_used_articles": used_articles,  # list of {id,title}
+                "cached_used_articles": used_articles,
                 "cached_confidence": confidence,
                 "last_clarifying_question": clarifying[0],
             })
@@ -630,7 +590,7 @@ def chat(req: ChatRequest):
             answer=answer,
             confidence=confidence,
             used_articles=[UsedArticle(**ua) for ua in used_articles],
-            show_escalation=show_escalation,
+            show_escalation=should_show_help_for_airstream(True, safety_escalation, confidence, web_mode=True),
             message_id=msg_id,
             clarifying_questions=clarifying,
             safety_flags=safety_flags,
