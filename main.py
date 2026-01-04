@@ -67,7 +67,7 @@ If you use web sources, include this line near the top:
 Cite web sources like: [web:<n>]
 """.strip()
 
-app = FastAPI(title="Vinnie's Brain API", version="0.3.1")
+app = FastAPI(title="Vinnie's Brain API", version="0.3.2")
 
 
 # -------------------------
@@ -135,6 +135,54 @@ def insert_message(
 
 
 # -------------------------
+# triage_state (cached web follow-up)
+# -------------------------
+def get_triage_state(conn, session_id: str) -> dict:
+    row = exec_one(conn, "SELECT triage_state FROM sessions WHERE id=%s", (session_id,))
+    if not row:
+        return {}
+    val = row.get("triage_state") if isinstance(row, dict) else row[0]
+    return val or {}
+
+
+def set_triage_state(conn, session_id: str, state: dict) -> None:
+    exec_no_return(
+        conn,
+        "UPDATE sessions SET triage_state=%s::jsonb WHERE id=%s",
+        (json.dumps(state or {}), session_id),
+    )
+
+
+# -------------------------
+# Conversation history (so yes/no follow-ups make sense)
+# -------------------------
+def get_recent_messages(conn, session_id: str, limit: int = 18) -> List[Dict[str, Any]]:
+    return exec_all(
+        conn,
+        """
+        SELECT role, content
+        FROM messages
+        WHERE session_id=%s
+        ORDER BY created_at DESC
+        LIMIT %s
+        """,
+        (session_id, limit),
+    )
+
+
+def format_conversation(conn, session_id: str, limit: int = 18) -> str:
+    rows = list(reversed(get_recent_messages(conn, session_id, limit)))
+    lines: List[str] = []
+    for r in rows:
+        role = (r.get("role") or "").strip()
+        content = (r.get("content") or "").strip()
+        if not role or not content:
+            continue
+        lines.append(f"{role}: {content}")
+    return "\n".join(lines)
+
+
+# -------------------------
 # Models
 # -------------------------
 class CreateSessionRequest(BaseModel):
@@ -170,7 +218,6 @@ class ChatResponse(BaseModel):
     used_articles: List[UsedArticle] = []
     show_escalation: bool = False
     message_id: str
-    # ✅ these match your frontend optional fields, but now they’ll actually be sent
     clarifying_questions: List[str] = []
     safety_flags: List[str] = []
 
@@ -232,6 +279,22 @@ def is_airstream_question(text: str, year: Optional[int]) -> bool:
     return any(k in t for k in keywords)
 
 
+def parse_yes_no(text: str) -> Optional[str]:
+    t = (text or "").strip().lower()
+    yes = {"yes", "y", "yeah", "yep", "true", "correct"}
+    no = {"no", "n", "nope", "false", "incorrect"}
+    if t in yes:
+        return "yes"
+    if t in no:
+        return "no"
+    return None
+
+
+def is_simple_followup(text: str) -> bool:
+    t = (text or "").strip().lower()
+    return parse_yes_no(t) in {"yes", "no"} or t in {"skip", "not sure", "unsure", "idk"}
+
+
 def build_kb_sources_context(rows: List[Tuple[Dict[str, Any], float]]) -> Tuple[str, List[Dict[str, Any]], float]:
     if not rows:
         return "", [], 0.0
@@ -285,20 +348,16 @@ def enforce_one_question(answer: str) -> Tuple[str, List[str]]:
     """
     If the model output includes any question marks, we force it to ask ONLY ONE question
     and return ONLY that single question (no info dump).
+    Returns: (answer_text, [single_question] or [])
     """
     a = (answer or "").strip()
     if "?" not in a:
         return a, []
 
-    # Take only up to the first question mark
     first_q = a[: a.find("?") + 1].strip()
 
-    # Remove leading filler lines if present and keep it clean
-    # e.g. "Note: ...\n\nQuestion?" -> keep both only if the note is required (web fallback).
-    # We'll keep required web note if it's present, otherwise only the question.
     lower = a.lower()
     if "includes information from the web" in lower:
-        # Keep the first "Note: ..." line plus the question
         lines = [ln.strip() for ln in a.splitlines() if ln.strip()]
         note_line = None
         for ln in lines[:3]:
@@ -427,13 +486,56 @@ def chat(req: ChatRequest):
                 safety_flags=[],
             )
 
+        # ✅ Cached web follow-up (DO NOT rerun web_search)
+        state = get_triage_state(conn, req.session_id) or {}
+        if state.get("web_followup_active") and is_simple_followup(user_text):
+            cached_combined = state.get("cached_combined_context") or ""
+            cached_used = state.get("cached_used_articles") or []
+            cached_conf = float(state.get("cached_confidence") or 0.35)
+
+            conversation = format_conversation(conn, req.session_id, limit=18)
+
+            raw = generate_answer(
+                system_prompt=WEB_FALLBACK_PROMPT,
+                kb_context=cached_combined + "\n\nCONVERSATION:\n" + conversation,
+                user_message=user_text,
+            )
+
+            answer, clarifying = enforce_one_question(raw)
+
+            # Stay in follow-up mode only if we asked another question
+            if clarifying:
+                state["web_followup_active"] = True
+                state["last_clarifying_question"] = clarifying[0]
+            else:
+                state = {}
+
+            set_triage_state(conn, req.session_id, state)
+
+            msg_id = insert_message(conn, req.session_id, "assistant", answer, used_articles=cached_used, confidence=cached_conf)
+            conn.commit()
+            return ChatResponse(
+                answer=answer,
+                confidence=cached_conf,
+                used_articles=[UsedArticle(**ua) for ua in cached_used] if cached_used else [],
+                show_escalation=show_escalation,
+                message_id=msg_id,
+                clarifying_questions=clarifying,
+                safety_flags=safety_flags,
+            )
+
         airstreamish = is_airstream_question(user_text, year)
+
+        # If user sends a new (non-followup) message, clear cached web follow-up
+        if state.get("web_followup_active") and not is_simple_followup(user_text):
+            set_triage_state(conn, req.session_id, {})
 
         # 1) Non-Airstream: answer normally, but keep it short and single-question-safe
         if not airstreamish:
+            conversation = format_conversation(conn, req.session_id, limit=18)
             raw = generate_answer(
                 system_prompt=SYSTEM_PROMPT + "\n\nKeep it concise. If you ask a question, ask only ONE.",
-                kb_context="(No internal sources used.)",
+                kb_context="CONVERSATION:\n" + conversation + "\n\n(No internal sources used.)",
                 user_message=user_text,
             )
             answer, clarifying = enforce_one_question(raw)
@@ -455,9 +557,10 @@ def chat(req: ChatRequest):
         kb_context, used_articles, kb_score = build_kb_sources_context(retrieved)
 
         if retrieved and kb_score >= CONFIDENCE_THRESHOLD:
+            conversation = format_conversation(conn, req.session_id, limit=18)
             raw = generate_answer(
                 system_prompt=KB_ONLY_PROMPT,
-                kb_context=kb_context,
+                kb_context=kb_context + "\n\nCONVERSATION:\n" + conversation,
                 user_message=user_text,
             )
             answer, clarifying = enforce_one_question(raw)
@@ -474,7 +577,7 @@ def chat(req: ChatRequest):
             )
 
         # 3) KB not confident -> Web fallback (clearly labeled + low confidence)
-        web_results = []
+        web_results: List[Dict[str, Any]] = []
         try:
             web_results = web_search(f"Airstream {year or ''} {user_text}".strip(), max_results=WEB_RESULTS_K)
         except WebSearchError:
@@ -493,9 +596,11 @@ def chat(req: ChatRequest):
             ]
         )
 
+        conversation = format_conversation(conn, req.session_id, limit=18)
+
         raw = generate_answer(
             system_prompt=WEB_FALLBACK_PROMPT,
-            kb_context=combined_context,
+            kb_context=combined_context + "\n\nCONVERSATION:\n" + conversation,
             user_message=user_text,
         )
 
@@ -505,8 +610,20 @@ def chat(req: ChatRequest):
             raw = disclaimer + "\n\n" + (raw or "")
 
         answer, clarifying = enforce_one_question(raw)
-
         confidence = 0.35
+
+        # ✅ Cache web context ONLY if we asked a follow-up question
+        if clarifying:
+            set_triage_state(conn, req.session_id, {
+                "web_followup_active": True,
+                "cached_combined_context": combined_context,
+                "cached_used_articles": used_articles,  # list of {id,title}
+                "cached_confidence": confidence,
+                "last_clarifying_question": clarifying[0],
+            })
+        else:
+            set_triage_state(conn, req.session_id, {})
+
         msg_id = insert_message(conn, req.session_id, "assistant", answer, used_articles=used_articles, confidence=confidence)
         conn.commit()
         return ChatResponse(
