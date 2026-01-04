@@ -73,7 +73,7 @@ If you use web sources, include this line near the top:
 Cite web sources like: [web:<n>]
 """.strip()
 
-app = FastAPI(title="Vinnie's Brain API", version="1.1.0")
+app = FastAPI(title="Vinnie's Brain API", version="1.1.1")
 
 
 # -------------------------
@@ -120,7 +120,8 @@ def get_session(conn, session_id: str) -> Dict[str, Any]:
     return row
 
 
-def insert_message(
+# ✅ IMPORTANT: AI chat history is stored in chat_messages, not messages
+def insert_chat_message(
     conn,
     session_id: str,
     role: str,
@@ -132,7 +133,7 @@ def insert_message(
     exec_no_return(
         conn,
         """
-        INSERT INTO messages (id, session_id, role, content, used_articles, confidence)
+        INSERT INTO chat_messages (id, session_id, role, content, used_articles, confidence)
         VALUES (%s, %s, %s, %s, %s::jsonb, %s)
         """,
         (mid, session_id, role, content, json.dumps(used_articles or []), confidence),
@@ -145,7 +146,10 @@ def insert_message(
 # -------------------------
 def _sb_headers():
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-        raise HTTPException(status_code=500, detail="Supabase is not configured (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY).")
+        raise HTTPException(
+            status_code=500,
+            detail="Supabase is not configured (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY).",
+        )
 
     return {
         "apikey": SUPABASE_SERVICE_ROLE_KEY,
@@ -212,17 +216,10 @@ def send_expo_push(to_token: str, title: str, body: str, data: Optional[dict] = 
         return
 
     url = "https://exp.host/--/api/v2/push/send"
-    payload = {
-        "to": to_token,
-        "title": title,
-        "body": body,
-        "data": data or {},
-        "sound": "default",
-    }
+    payload = {"to": to_token, "title": title, "body": body, "data": data or {}, "sound": "default"}
 
     if requests:
         r = requests.post(url, headers={"Content-Type": "application/json", "Accept": "application/json"}, json=payload, timeout=15)
-        # Don't hard-fail your app flow if push fails
         if r.status_code >= 400:
             print("Expo push failed:", r.status_code, r.text)
     else:
@@ -256,22 +253,18 @@ def get_triage_state(conn, session_id: str) -> dict:
 
 
 def set_triage_state(conn, session_id: str, state: dict) -> None:
-    exec_no_return(
-        conn,
-        "UPDATE sessions SET triage_state=%s::jsonb WHERE id=%s",
-        (json.dumps(state or {}), session_id),
-    )
+    exec_no_return(conn, "UPDATE sessions SET triage_state=%s::jsonb WHERE id=%s", (json.dumps(state or {}), session_id))
 
 
 # -------------------------
-# Conversation history (so yes/no follow-ups make sense)
+# Conversation history (AI chat history from chat_messages)
 # -------------------------
 def get_recent_messages(conn, session_id: str, limit: int = 18) -> List[Dict[str, Any]]:
     return exec_all(
         conn,
         """
         SELECT role, content
-        FROM messages
+        FROM chat_messages
         WHERE session_id=%s
         ORDER BY created_at DESC
         LIMIT %s
@@ -400,7 +393,6 @@ def is_simple_followup(text: str) -> bool:
 
 
 def should_show_help_for_airstream(airstreamish: bool, safety: bool, confidence: float, web_mode: bool = False) -> bool:
-    # HARD-LOCK: only show help for Airstream issues
     if not airstreamish:
         return False
     return safety or web_mode or (confidence < CONFIDENCE_THRESHOLD)
@@ -533,7 +525,6 @@ def retrieve_articles(conn, query_embedding: List[float], airstream_year: Option
 # Supabase live chat logic
 # -------------------------
 def get_or_create_conversation_for_session(session_id: str) -> str:
-    # session_id is a UUID string; we reuse it as customer_id in supabase
     rows = sb_get(
         "conversations",
         {
@@ -547,11 +538,13 @@ def get_or_create_conversation_for_session(session_id: str) -> str:
     if isinstance(rows, list) and rows:
         return rows[0]["id"]
 
-    payload = [{
-        "customer_id": session_id,
-        "assigned_owner_id": OWNER_SUPABASE_USER_ID or None,
-        "status": "open",
-    }]
+    payload = [
+        {
+            "customer_id": session_id,
+            "assigned_owner_id": OWNER_SUPABASE_USER_ID or None,
+            "status": "open",
+        }
+    ]
     created = sb_post("conversations", payload)
     if not created or not isinstance(created, list):
         raise HTTPException(status_code=502, detail="Failed to create supabase conversation.")
@@ -559,12 +552,14 @@ def get_or_create_conversation_for_session(session_id: str) -> str:
 
 
 def supabase_insert_message(conversation_id: str, sender_id: str, sender_role: str, body: str) -> dict:
-    payload = [{
-        "conversation_id": conversation_id,
-        "sender_id": sender_id,
-        "sender_role": sender_role,
-        "body": body,
-    }]
+    payload = [
+        {
+            "conversation_id": conversation_id,
+            "sender_id": sender_id,
+            "sender_role": sender_role,
+            "body": body,
+        }
+    ]
     created = sb_post("messages", payload)
     if not created or not isinstance(created, list):
         raise HTTPException(status_code=502, detail="Failed to insert supabase message.")
@@ -608,25 +603,16 @@ def session_exists(session_id: str):
 def update_context(session_id: str, req: UpdateContextRequest):
     with db() as conn:
         get_session(conn, session_id)
-        exec_no_return(
-            conn,
-            "UPDATE sessions SET airstream_year=%s, category=%s WHERE id=%s",
-            (req.airstream_year, req.category, session_id),
-        )
+        exec_no_return(conn, "UPDATE sessions SET airstream_year=%s, category=%s WHERE id=%s", (req.airstream_year, req.category, session_id))
         conn.commit()
     return {"ok": True}
 
 
 @app.post("/v1/owner/push-token")
 def register_owner_push_token(req: OwnerPushTokenRequest):
-    # Upsert owner push token into supabase
-    # Requires table owner_push_tokens
     _ = sb_upsert(
         "owner_push_tokens",
-        [{
-            "owner_id": req.owner_id,
-            "expo_push_token": req.expo_push_token,
-        }],
+        [{"owner_id": req.owner_id, "expo_push_token": req.expo_push_token}],
         on_conflict="owner_id",
     )
     return {"ok": True}
@@ -634,11 +620,9 @@ def register_owner_push_token(req: OwnerPushTokenRequest):
 
 @app.post("/v1/livechat/send")
 def livechat_send(req: LiveChatSendRequest):
-    # Creates a supabase conversation if needed and inserts a customer message.
     conversation_id = get_or_create_conversation_for_session(req.session_id)
     msg = supabase_insert_message(conversation_id, req.session_id, "customer", req.body)
 
-    # Push notify owner (if token exists)
     token = get_owner_push_token(OWNER_SUPABASE_USER_ID) if OWNER_SUPABASE_USER_ID else None
     if token:
         send_expo_push(
@@ -653,7 +637,6 @@ def livechat_send(req: LiveChatSendRequest):
 
 @app.get("/v1/livechat/history/{session_id}")
 def livechat_history(session_id: str):
-    # Return last messages for that session's open conversation
     conv_id = get_or_create_conversation_for_session(session_id)
     rows = sb_get(
         "messages",
@@ -666,6 +649,7 @@ def livechat_history(session_id: str):
     )
     return {"conversation_id": conv_id, "messages": rows or []}
 
+
 @app.get("/v1/debug/tavily")
 def debug_tavily():
     try:
@@ -675,21 +659,21 @@ def debug_tavily():
         return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
 
 
-
 @app.post("/v1/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
     with db() as conn:
         sess = get_session(conn, req.session_id)
-        insert_message(conn, req.session_id, "user", req.message)
+
+        # ✅ store AI chat history in chat_messages
+        insert_chat_message(conn, req.session_id, "user", req.message)
 
         year = req.airstream_year or sess.get("airstream_year")
         user_text = (req.message or "").strip()
 
-        # Greeting
         if is_greeting(user_text):
             answer = "Hi 👋 What can I help with?"
             conf = 1.0
-            msg_id = insert_message(conn, req.session_id, "assistant", answer, used_articles=[], confidence=conf)
+            msg_id = insert_chat_message(conn, req.session_id, "assistant", answer, used_articles=[], confidence=conf)
             conn.commit()
             return ChatResponse(
                 answer=answer,
@@ -708,7 +692,6 @@ def chat(req: ChatRequest):
             f in safety_flags for f in ["active_water_intrusion", "structural_moisture_risk", "mold_risk", "electrical_risk"]
         )
 
-        # Cached web follow-up (no web_search)
         state = get_triage_state(conn, req.session_id) or {}
         if state.get("web_followup_active") and is_simple_followup(user_text):
             cached_combined = state.get("cached_combined_context") or ""
@@ -731,7 +714,7 @@ def chat(req: ChatRequest):
 
             set_triage_state(conn, req.session_id, state)
 
-            msg_id = insert_message(conn, req.session_id, "assistant", answer, used_articles=cached_used, confidence=cached_conf)
+            msg_id = insert_chat_message(conn, req.session_id, "assistant", answer, used_articles=cached_used, confidence=cached_conf)
             conn.commit()
             return ChatResponse(
                 answer=answer,
@@ -743,11 +726,10 @@ def chat(req: ChatRequest):
                 safety_flags=safety_flags,
             )
 
-        # If new message, clear cached follow-up
         if state.get("web_followup_active") and not is_simple_followup(user_text):
             set_triage_state(conn, req.session_id, {})
 
-        # Non-Airstream: normal answer, NEVER show Request Help
+        # Non-Airstream: never show Request Help
         if not airstreamish:
             conversation = format_conversation(conn, req.session_id, limit=18)
             raw = generate_answer(
@@ -757,7 +739,7 @@ def chat(req: ChatRequest):
             )
             answer, clarifying = enforce_one_question(raw)
             conf = 0.85
-            msg_id = insert_message(conn, req.session_id, "assistant", answer, used_articles=[], confidence=conf)
+            msg_id = insert_chat_message(conn, req.session_id, "assistant", answer, used_articles=[], confidence=conf)
             conn.commit()
             return ChatResponse(
                 answer=answer,
@@ -784,7 +766,7 @@ def chat(req: ChatRequest):
             )
             answer, clarifying = enforce_one_question(raw)
 
-            msg_id = insert_message(conn, req.session_id, "assistant", answer, used_articles=used_articles, confidence=kb_score)
+            msg_id = insert_chat_message(conn, req.session_id, "assistant", answer, used_articles=used_articles, confidence=kb_score)
             conn.commit()
             return ChatResponse(
                 answer=answer,
@@ -807,20 +789,17 @@ def chat(req: ChatRequest):
             print("web_search unexpected error:", str(e))
             web_results = []
 
-
         web_context = build_web_context(web_results)
 
         combined_context = "\n\n".join(
             [
-                "VINNIE’S BRAIN INTERNAL CHECK:\n"
-                + (f"Top internal match score: {kb_score:.3f}\n" if retrieved else "No internal matches found.\n"),
+                "VINNIE’S BRAIN INTERNAL CHECK:\n" + (f"Top internal match score: {kb_score:.3f}\n" if retrieved else "No internal matches found.\n"),
                 kb_context if kb_context else "(No internal sources found.)",
                 web_context,
             ]
         )
 
         conversation = format_conversation(conn, req.session_id, limit=18)
-
         raw = generate_answer(
             system_prompt=WEB_FALLBACK_PROMPT,
             kb_context=combined_context + "\n\nCONVERSATION:\n" + conversation,
@@ -835,17 +814,21 @@ def chat(req: ChatRequest):
         confidence = 0.35
 
         if clarifying:
-            set_triage_state(conn, req.session_id, {
-                "web_followup_active": True,
-                "cached_combined_context": combined_context,
-                "cached_used_articles": used_articles,
-                "cached_confidence": confidence,
-                "last_clarifying_question": clarifying[0],
-            })
+            set_triage_state(
+                conn,
+                req.session_id,
+                {
+                    "web_followup_active": True,
+                    "cached_combined_context": combined_context,
+                    "cached_used_articles": used_articles,
+                    "cached_confidence": confidence,
+                    "last_clarifying_question": clarifying[0],
+                },
+            )
         else:
             set_triage_state(conn, req.session_id, {})
 
-        msg_id = insert_message(conn, req.session_id, "assistant", answer, used_articles=used_articles, confidence=confidence)
+        msg_id = insert_chat_message(conn, req.session_id, "assistant", answer, used_articles=used_articles, confidence=confidence)
         conn.commit()
         return ChatResponse(
             answer=answer,
@@ -860,7 +843,5 @@ def chat(req: ChatRequest):
 
 @app.post("/v1/escalations")
 def create_escalation(payload: Dict[str, Any]):
-    # Keep as simple ticket creation (you can later email/store)
     ticket_id = str(uuid.uuid4())
     return {"ticket_id": ticket_id}
-    
