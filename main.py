@@ -666,6 +666,15 @@ def livechat_history(session_id: str):
     )
     return {"conversation_id": conv_id, "messages": rows or []}
 
+@app.get("/v1/debug/tavily")
+def debug_tavily():
+    try:
+        r = web_search("Airstream winterize", max_results=2)
+        return {"ok": True, "count": len(r), "sample": r[:1]}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+
+
 
 @app.post("/v1/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
@@ -791,10 +800,13 @@ def chat(req: ChatRequest):
         web_results: List[Dict[str, Any]] = []
         try:
             web_results = web_search(f"Airstream {year or ''} {user_text}".strip(), max_results=WEB_RESULTS_K)
-        except WebSearchError:
+        except WebSearchError as e:
+            print("web_search failed:", str(e))
             web_results = []
-        except Exception:
+        except Exception as e:
+            print("web_search unexpected error:", str(e))
             web_results = []
+
 
         web_context = build_web_context(web_results)
 
@@ -851,3 +863,4 @@ def create_escalation(payload: Dict[str, Any]):
     # Keep as simple ticket creation (you can later email/store)
     ticket_id = str(uuid.uuid4())
     return {"ticket_id": ticket_id}
+    
