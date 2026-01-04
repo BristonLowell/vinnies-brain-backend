@@ -10,9 +10,9 @@ from typing import List, Optional, Dict, Any, Tuple
 import psycopg
 from psycopg.rows import dict_row
 
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
-from fastapi.requests import Request
+from fastapi import Request
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
@@ -35,44 +35,52 @@ You can answer general questions normally.
 For Airstream troubleshooting questions, prioritize safety and clarity.
 """
 
-# When using internal KB only
+# KB-only prompt (STRICT)
 KB_ONLY_PROMPT = """
 You are Vinnie’s Brain.
 
-Answer the user using ONLY the provided VINNIE’S BRAIN INTERNAL SOURCES.
-If the internal sources don’t contain the answer, say:
-"I couldn’t find that in Vinnie’s Brain."
+Rules:
+- Use ONLY the provided VINNIE’S BRAIN INTERNAL SOURCES.
+- If the sources don’t contain the answer, say exactly: "I couldn’t find that in Vinnie’s Brain."
+- If you ask a question, ask EXACTLY ONE question.
+- Any question you ask must be YES/NO only.
+- Keep responses short and action-oriented. No long explanations.
 
-Then ask 1–2 clarifying questions to help retrieve the right internal info.
-
-Be conversational and helpful.
 Cite internal sources like: [kb:<id>]
 """.strip()
 
-# When using the web (fallback)
+# Web fallback prompt (STRICT)
 WEB_FALLBACK_PROMPT = """
 You are Vinnie’s Brain.
 
 You may use the provided WEB SOURCES.
-Important:
+Rules:
 - Clearly label anything supported by web sources as NOT from Vinnie’s Brain.
-- Include a caution that web info can be wrong or vary by model/year.
-- Use a lower-confidence tone (e.g., "I’m not fully confident, but...").
+- Web info can be wrong or vary by model/year; keep a cautious tone.
+- If you ask a question, ask EXACTLY ONE question.
+- Any question you ask must be YES/NO only.
+- Keep responses short. No long explanations.
 
 If you use web sources, include this line near the top:
 "Note: This answer includes information from the web, not from Vinnie’s Brain. Confidence: Low."
 
-Cite web sources like: [web:<n>] where n is the web result number.
+Cite web sources like: [web:<n>]
 """.strip()
 
-app = FastAPI(title="Vinnie's Brain API", version="0.3.0")
+app = FastAPI(title="Vinnie's Brain API", version="0.3.1")
 
 
+# -------------------------
+# Debug exception handler
+# -------------------------
 @app.exception_handler(Exception)
 async def all_exception_handler(request: Request, exc: Exception):
     return JSONResponse(status_code=500, content={"error": str(exc), "trace": traceback.format_exc()})
 
 
+# -------------------------
+# DB
+# -------------------------
 @contextmanager
 def db():
     conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
@@ -162,6 +170,9 @@ class ChatResponse(BaseModel):
     used_articles: List[UsedArticle] = []
     show_escalation: bool = False
     message_id: str
+    # ✅ these match your frontend optional fields, but now they’ll actually be sent
+    clarifying_questions: List[str] = []
+    safety_flags: List[str] = []
 
 
 # -------------------------
@@ -200,14 +211,13 @@ def json_list(val) -> list:
 
 def is_greeting(text: str) -> bool:
     t = (text or "").strip().lower()
-    return t in {"hi", "hello", "hey", "hi there", "hey there", "good morning", "good afternoon", "good evening"}
+    return t in {
+        "hi", "hello", "hey", "hi there", "hey there",
+        "good morning", "good afternoon", "good evening"
+    }
 
 
 def is_airstream_question(text: str, year: Optional[int]) -> bool:
-    """
-    Heuristic: if they provided an Airstream year, or mention Airstream/RV/trailer systems.
-    You can tighten/loosen this later.
-    """
     if year is not None:
         return True
     t = (text or "").lower()
@@ -269,6 +279,37 @@ def build_web_context(results: List[Dict[str, Any]]) -> str:
             )
         )
     return "WEB SOURCES:\n\n" + "\n\n---\n\n".join(parts)
+
+
+def enforce_one_question(answer: str) -> Tuple[str, List[str]]:
+    """
+    If the model output includes any question marks, we force it to ask ONLY ONE question
+    and return ONLY that single question (no info dump).
+    """
+    a = (answer or "").strip()
+    if "?" not in a:
+        return a, []
+
+    # Take only up to the first question mark
+    first_q = a[: a.find("?") + 1].strip()
+
+    # Remove leading filler lines if present and keep it clean
+    # e.g. "Note: ...\n\nQuestion?" -> keep both only if the note is required (web fallback).
+    # We'll keep required web note if it's present, otherwise only the question.
+    lower = a.lower()
+    if "includes information from the web" in lower:
+        # Keep the first "Note: ..." line plus the question
+        lines = [ln.strip() for ln in a.splitlines() if ln.strip()]
+        note_line = None
+        for ln in lines[:3]:
+            if "includes information from the web" in ln.lower():
+                note_line = ln
+                break
+        if note_line and note_line not in first_q:
+            forced = note_line + "\n\n" + first_q
+            return forced, [first_q]
+
+    return first_q, [first_q]
 
 
 # -------------------------
@@ -366,54 +407,60 @@ def chat(req: ChatRequest):
         year = req.airstream_year or sess.get("airstream_year")
         user_text = (req.message or "").strip()
 
-        # Friendly greeting behavior (so "hello" doesn’t trigger a failed retrieval)
-        if is_greeting(user_text):
-            answer = (
-                "Hi 👋\n\n"
-                "Ask me anything.\n"
-                "If it’s Airstream-related, I’ll check Vinnie’s Brain first. "
-                "If I can’t find it internally, I can pull from the web and I’ll label that clearly.\n\n"
-                "What can I help with?"
-            )
-            msg_id = insert_message(conn, req.session_id, "assistant", answer, used_articles=[], confidence=1.0)
-            conn.commit()
-            return ChatResponse(answer=answer, confidence=1.0, used_articles=[], show_escalation=False, message_id=msg_id)
-
         safety_flags = detect_safety_flags(user_text)
         show_escalation = any(
             f in safety_flags for f in ["active_water_intrusion", "structural_moisture_risk", "mold_risk", "electrical_risk"]
         )
 
-        # Decide if we should do KB-first routing
+        # Friendly greeting behavior
+        if is_greeting(user_text):
+            answer = "Hi 👋 What can I help with?"
+            msg_id = insert_message(conn, req.session_id, "assistant", answer, used_articles=[], confidence=1.0)
+            conn.commit()
+            return ChatResponse(
+                answer=answer,
+                confidence=1.0,
+                used_articles=[],
+                show_escalation=False,
+                message_id=msg_id,
+                clarifying_questions=[],
+                safety_flags=[],
+            )
+
         airstreamish = is_airstream_question(user_text, year)
 
-        # ---------------------------------------------------------
-        # 1) If NOT Airstream-related: answer normally (no KB, no web)
-        # ---------------------------------------------------------
+        # 1) Non-Airstream: answer normally, but keep it short and single-question-safe
         if not airstreamish:
-            answer = generate_answer(
-                system_prompt=SYSTEM_PROMPT,
+            raw = generate_answer(
+                system_prompt=SYSTEM_PROMPT + "\n\nKeep it concise. If you ask a question, ask only ONE.",
                 kb_context="(No internal sources used.)",
                 user_message=user_text,
             )
+            answer, clarifying = enforce_one_question(raw)
             msg_id = insert_message(conn, req.session_id, "assistant", answer, used_articles=[], confidence=0.85)
             conn.commit()
-            return ChatResponse(answer=answer, confidence=0.85, used_articles=[], show_escalation=False, message_id=msg_id)
+            return ChatResponse(
+                answer=answer,
+                confidence=0.85,
+                used_articles=[],
+                show_escalation=False,
+                message_id=msg_id,
+                clarifying_questions=clarifying,
+                safety_flags=safety_flags,
+            )
 
-        # ---------------------------------------------------------
         # 2) Airstream-related: KB first
-        # ---------------------------------------------------------
         q_emb = embed_text(user_text)
         retrieved = retrieve_articles(conn, q_emb, year, top_k=TOP_K)
         kb_context, used_articles, kb_score = build_kb_sources_context(retrieved)
 
-        # If KB is confident: answer from KB only
         if retrieved and kb_score >= CONFIDENCE_THRESHOLD:
-            answer = generate_answer(
+            raw = generate_answer(
                 system_prompt=KB_ONLY_PROMPT,
                 kb_context=kb_context,
                 user_message=user_text,
             )
+            answer, clarifying = enforce_one_question(raw)
             msg_id = insert_message(conn, req.session_id, "assistant", answer, used_articles=used_articles, confidence=kb_score)
             conn.commit()
             return ChatResponse(
@@ -422,23 +469,21 @@ def chat(req: ChatRequest):
                 used_articles=[UsedArticle(**ua) for ua in used_articles],
                 show_escalation=show_escalation,
                 message_id=msg_id,
+                clarifying_questions=clarifying,
+                safety_flags=safety_flags,
             )
 
-        # ---------------------------------------------------------
         # 3) KB not confident -> Web fallback (clearly labeled + low confidence)
-        # ---------------------------------------------------------
         web_results = []
         try:
             web_results = web_search(f"Airstream {year or ''} {user_text}".strip(), max_results=WEB_RESULTS_K)
         except WebSearchError:
-            # Web search not configured; still respond but say you couldn't verify
             web_results = []
         except Exception:
             web_results = []
 
         web_context = build_web_context(web_results)
 
-        # We allow web use here, but we must label it clearly
         combined_context = "\n\n".join(
             [
                 "VINNIE’S BRAIN INTERNAL CHECK:\n"
@@ -448,20 +493,20 @@ def chat(req: ChatRequest):
             ]
         )
 
-        answer = generate_answer(
+        raw = generate_answer(
             system_prompt=WEB_FALLBACK_PROMPT,
             kb_context=combined_context,
             user_message=user_text,
         )
 
-        # Force the “low confidence / not from Vinnie’s Brain” label even if model forgets
-        disclaimer = "Note: This answer includes information from the web, not from Vinnie’s Brain. Confidence: Low.\n\n"
-        if "includes information from the web" not in answer.lower():
-            answer = disclaimer + answer
+        # Force disclaimer if model forgets
+        disclaimer = "Note: This answer includes information from the web, not from Vinnie’s Brain. Confidence: Low."
+        if "includes information from the web" not in (raw or "").lower():
+            raw = disclaimer + "\n\n" + (raw or "")
 
-        # Low confidence number (you can tune)
+        answer, clarifying = enforce_one_question(raw)
+
         confidence = 0.35
-
         msg_id = insert_message(conn, req.session_id, "assistant", answer, used_articles=used_articles, confidence=confidence)
         conn.commit()
         return ChatResponse(
@@ -470,4 +515,6 @@ def chat(req: ChatRequest):
             used_articles=[UsedArticle(**ua) for ua in used_articles],
             show_escalation=show_escalation,
             message_id=msg_id,
+            clarifying_questions=clarifying,
+            safety_flags=safety_flags,
         )
