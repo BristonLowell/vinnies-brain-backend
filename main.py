@@ -267,7 +267,6 @@ def get_recent_messages(conn, session_id: str, limit: int = 20):
     )
 
 
-
 # =========================
 # RAG helpers (existing)
 # =========================
@@ -319,6 +318,27 @@ def get_or_create_conversation_for_session(session_id: str) -> str:
     if not created or not isinstance(created, list) or not created[0].get("id"):
         raise HTTPException(status_code=502, detail="Failed to create supabase conversation.")
     return created[0]["id"]
+
+
+def get_or_create_conversation_for_session_with_flag(session_id: str) -> Tuple[str, bool]:
+    """
+    Returns (conversation_id, is_new).
+    is_new=True only when we create the conversation for the first time.
+    """
+    rows = sb_get(
+        "conversations",
+        {"select": "id", "customer_id": f"eq.{session_id}", "limit": "1"},
+    )
+    if rows and isinstance(rows, list) and rows[0].get("id"):
+        return rows[0]["id"], False
+
+    created = sb_post(
+        "conversations",
+        [{"customer_id": session_id}],
+    )
+    if not created or not isinstance(created, list) or not created[0].get("id"):
+        raise HTTPException(status_code=502, detail="Failed to create supabase conversation.")
+    return created[0]["id"], True
 
 
 def supabase_insert_message(conversation_id: str, sender_id: str, sender_role: str, body: str) -> dict:
@@ -490,17 +510,19 @@ def register_owner_push_token(req: OwnerPushTokenRequest):
 
 @app.post("/v1/livechat/send")
 def livechat_send(req: LiveChatSendRequest):
-    conversation_id = get_or_create_conversation_for_session(req.session_id)
+    conversation_id, is_new = get_or_create_conversation_for_session_with_flag(req.session_id)
     msg = supabase_insert_message(conversation_id, req.session_id, "customer", req.body)
 
-    token = get_owner_push_token(OWNER_SUPABASE_USER_ID) if OWNER_SUPABASE_USER_ID else None
-    if token:
-        send_expo_push(
-            token,
-            title="New chat message",
-            body=req.body[:120],
-            data={"conversation_id": conversation_id, "session_id": req.session_id},
-        )
+    # Notify owner ONLY when a new conversation is created (not on every message)
+    if is_new:
+        token = get_owner_push_token(OWNER_SUPABASE_USER_ID) if OWNER_SUPABASE_USER_ID else None
+        if token:
+            send_expo_push(
+                token,
+                title="New live chat started",
+                body="A customer started a new conversation.",
+                data={"conversation_id": conversation_id, "session_id": req.session_id},
+            )
 
     return {"ok": True, "conversation_id": conversation_id, "message": msg}
 
@@ -518,6 +540,28 @@ def livechat_history(session_id: str):
         },
     )
     return {"conversation_id": conv_id, "messages": rows or []}
+
+
+# =========================
+# Admin AI history for a session (chat_messages table)
+# =========================
+@app.get("/v1/admin/ai-history/{session_id}")
+def admin_ai_history(session_id: str, x_admin_key: str = Header(default="", alias="X-Admin-Key")):
+    require_admin(x_admin_key)
+
+    with db() as conn:
+        rows = exec_all(
+            conn,
+            """
+            SELECT role, content AS text, created_at
+            FROM chat_messages
+            WHERE session_id=%s
+            ORDER BY created_at ASC
+            LIMIT 200
+            """,
+            (session_id,),
+        )
+    return {"session_id": session_id, "messages": rows or []}
 
 
 # =========================
@@ -607,7 +651,7 @@ def admin_livechat_send(
     return {"ok": True, "conversation_id": req.conversation_id, "message": msg}
 
 
-@app.exception_handler(Exception)
-async def function_exception_handler(request: Request, exc: Exception):
-    traceback.print_exc()
-    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+# @app.exception_handler(Exception)
+# async function_exception_handler(request: Request, exc: Exception):
+#     traceback.print_exc()
+#     return JSONResponse(status_code=500, content={"detail": str(exc)})
