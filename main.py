@@ -275,9 +275,9 @@ def embed(text: str) -> List[float]:
 
 
 def rank_kb_articles(conn, query_embedding: List[float], year: Optional[int], category: Optional[str], top_k: int = 6):
-    # NOTE: Your existing implementation lives here; keeping as-is.
+    # ✅ FIX: your kb_articles table doesn't have "body"; use customer_summary as body
     sql = """
-    SELECT id, title, body,
+    SELECT id, title, customer_summary AS body,
            1 - (embedding <=> %s::vector) AS score
       FROM kb_articles
      WHERE 1=1
