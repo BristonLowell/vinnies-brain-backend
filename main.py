@@ -205,6 +205,29 @@ class OwnerPushTokenRequest(BaseModel):
     expo_push_token: str
 
 
+class AdminArticleRequest(BaseModel):
+    title: str
+    category: str = "General"
+    severity: str = "Medium"
+    years_min: int = 2010
+    years_max: int = 2025
+
+    customer_summary: str
+    staff_summary: Optional[str] = ""
+
+    # Optional structured fields (if your kb_articles has columns for them, we’ll store them)
+    symptoms: Optional[List[str]] = None
+    likely_causes: Optional[List[str]] = None
+    diagnostics: Optional[List[str]] = None
+    steps: Optional[List[str]] = None
+    tools: Optional[List[str]] = None
+    parts: Optional[List[str]] = None
+    safety_notes: Optional[List[str]] = None
+
+    # Optional decision tree object
+    decision_tree: Optional[Dict[str, Any]] = None
+
+
 # =========================
 # Safety helpers
 # =========================
@@ -267,6 +290,7 @@ def get_recent_messages(conn, session_id: str, limit: int = 20):
     )
 
 
+
 # =========================
 # RAG helpers (existing)
 # =========================
@@ -301,6 +325,121 @@ def rank_kb_articles(conn, query_embedding: List[float], year: Optional[int], ca
 
 
 # =========================
+# KB admin helpers
+# =========================
+_KB_COLUMNS_CACHE: Optional[set] = None
+
+
+def _get_kb_columns(conn) -> set:
+    global _KB_COLUMNS_CACHE
+    if _KB_COLUMNS_CACHE is not None:
+        return _KB_COLUMNS_CACHE
+
+    rows = exec_all(
+        conn,
+        "SELECT column_name FROM information_schema.columns WHERE table_name='kb_articles'",
+        (),
+    )
+    _KB_COLUMNS_CACHE = {r["column_name"] for r in (rows or []) if r.get("column_name")}
+    return _KB_COLUMNS_CACHE
+
+
+def _vector_literal(vec: List[float]) -> str:
+    # pgvector accepts a string like: [0.1,0.2,0.3]
+    return "[" + ",".join(f"{float(x):.8f}" for x in vec) + "]"
+
+
+def _kb_build_embed_text(payload: Dict[str, Any]) -> str:
+    # Build a single text blob we embed. Keep it stable and useful for semantic search.
+    parts: List[str] = []
+    parts.append(f"TITLE: {payload.get('title','')}")
+    parts.append(f"CATEGORY: {payload.get('category','')}")
+    parts.append(f"SEVERITY: {payload.get('severity','')}")
+    parts.append(f"YEARS: {payload.get('years_min','')} - {payload.get('years_max','')}")
+    if payload.get("customer_summary"):
+        parts.append("CUSTOMER_SUMMARY:\n" + str(payload["customer_summary"]))
+    if payload.get("staff_summary"):
+        parts.append("STAFF_SUMMARY:\n" + str(payload["staff_summary"]))
+    for key in ["symptoms", "likely_causes", "diagnostics", "steps", "tools", "parts", "safety_notes"]:
+        arr = payload.get(key)
+        if isinstance(arr, list) and arr:
+            parts.append(key.upper() + ":\n" + "\n".join(str(x) for x in arr))
+    if payload.get("decision_tree") is not None:
+        parts.append("DECISION_TREE_JSON:\n" + json.dumps(payload["decision_tree"]))
+    return "\n\n".join(parts).strip()
+
+
+def kb_insert_article(conn, req: AdminArticleRequest) -> Dict[str, Any]:
+    cols = _get_kb_columns(conn)
+
+    article_id = str(uuid.uuid4())
+
+    payload: Dict[str, Any] = {
+        "id": article_id,
+        "title": req.title.strip(),
+        "category": req.category.strip(),
+        "severity": req.severity.strip(),
+        "years_min": int(req.years_min),
+        "years_max": int(req.years_max),
+        "customer_summary": (req.customer_summary or "").strip(),
+        "staff_summary": (req.staff_summary or "").strip(),
+        "decision_tree": req.decision_tree,
+        "symptoms": req.symptoms,
+        "likely_causes": req.likely_causes,
+        "diagnostics": req.diagnostics,
+        "steps": req.steps,
+        "tools": req.tools,
+        "parts": req.parts,
+        "safety_notes": req.safety_notes,
+    }
+
+    # Compute embedding from a stable “document”
+    doc_text = _kb_build_embed_text(payload)
+    emb = embed_text(doc_text)
+    emb_literal = _vector_literal(emb)
+
+    # Build INSERT dynamically based on actual columns present
+    insert_cols: List[str] = []
+    insert_vals: List[str] = []
+    params: List[Any] = []
+
+    def add(col: str, val: Any):
+        if col in cols:
+            insert_cols.append(col)
+            insert_vals.append("%s")
+            params.append(val)
+
+    add("id", payload["id"])
+    add("title", payload["title"])
+    add("category", payload["category"])
+    add("severity", payload["severity"])
+    add("years_min", payload["years_min"])
+    add("years_max", payload["years_max"])
+    add("customer_summary", payload["customer_summary"])
+    add("staff_summary", payload["staff_summary"])
+    # decision_tree is commonly jsonb; we pass a JSON string (Postgres will cast if needed)
+    add("decision_tree", json.dumps(payload["decision_tree"]) if payload["decision_tree"] is not None else None)
+
+    # Optional list fields (only if the columns exist)
+    for col in ["symptoms", "likely_causes", "diagnostics", "steps", "tools", "parts", "safety_notes"]:
+        add(col, payload[col])
+
+    # embedding (pgvector)
+    if "embedding" in cols:
+        insert_cols.append("embedding")
+        insert_vals.append("%s::vector")
+        params.append(emb_literal)
+
+    if not insert_cols:
+        raise HTTPException(status_code=500, detail="kb_articles table has no insertable columns (unexpected).")
+
+    sql = f"INSERT INTO kb_articles ({', '.join(insert_cols)}) VALUES ({', '.join(insert_vals)}) RETURNING id, title"
+    row = exec_one(conn, sql, tuple(params))
+    return {"id": (row or {}).get("id", article_id), "title": (row or {}).get("title", payload["title"])}
+
+
+
+# =========================
 # Supabase live chat logic
 # =========================
 def get_or_create_conversation_for_session(session_id: str) -> str:
@@ -318,27 +457,6 @@ def get_or_create_conversation_for_session(session_id: str) -> str:
     if not created or not isinstance(created, list) or not created[0].get("id"):
         raise HTTPException(status_code=502, detail="Failed to create supabase conversation.")
     return created[0]["id"]
-
-
-def get_or_create_conversation_for_session_with_flag(session_id: str) -> Tuple[str, bool]:
-    """
-    Returns (conversation_id, is_new).
-    is_new=True only when we create the conversation for the first time.
-    """
-    rows = sb_get(
-        "conversations",
-        {"select": "id", "customer_id": f"eq.{session_id}", "limit": "1"},
-    )
-    if rows and isinstance(rows, list) and rows[0].get("id"):
-        return rows[0]["id"], False
-
-    created = sb_post(
-        "conversations",
-        [{"customer_id": session_id}],
-    )
-    if not created or not isinstance(created, list) or not created[0].get("id"):
-        raise HTTPException(status_code=502, detail="Failed to create supabase conversation.")
-    return created[0]["id"], True
 
 
 def supabase_insert_message(conversation_id: str, sender_id: str, sender_role: str, body: str) -> dict:
@@ -510,19 +628,17 @@ def register_owner_push_token(req: OwnerPushTokenRequest):
 
 @app.post("/v1/livechat/send")
 def livechat_send(req: LiveChatSendRequest):
-    conversation_id, is_new = get_or_create_conversation_for_session_with_flag(req.session_id)
+    conversation_id = get_or_create_conversation_for_session(req.session_id)
     msg = supabase_insert_message(conversation_id, req.session_id, "customer", req.body)
 
-    # Notify owner ONLY when a new conversation is created (not on every message)
-    if is_new:
-        token = get_owner_push_token(OWNER_SUPABASE_USER_ID) if OWNER_SUPABASE_USER_ID else None
-        if token:
-            send_expo_push(
-                token,
-                title="New live chat started",
-                body="A customer started a new conversation.",
-                data={"conversation_id": conversation_id, "session_id": req.session_id},
-            )
+    token = get_owner_push_token(OWNER_SUPABASE_USER_ID) if OWNER_SUPABASE_USER_ID else None
+    if token:
+        send_expo_push(
+            token,
+            title="New chat message",
+            body=req.body[:120],
+            data={"conversation_id": conversation_id, "session_id": req.session_id},
+        )
 
     return {"ok": True, "conversation_id": conversation_id, "message": msg}
 
@@ -542,26 +658,26 @@ def livechat_history(session_id: str):
     return {"conversation_id": conv_id, "messages": rows or []}
 
 
+
+
 # =========================
-# Admin AI history for a session (chat_messages table)
+# Admin KB article create (good-enough version)
 # =========================
-@app.get("/v1/admin/ai-history/{session_id}")
-def admin_ai_history(session_id: str, x_admin_key: str = Header(default="", alias="X-Admin-Key")):
+@app.post("/v1/admin/articles")
+def admin_create_article(
+    req: AdminArticleRequest, x_admin_key: str = Header(default="", alias="X-Admin-Key")
+):
     require_admin(x_admin_key)
 
     with db() as conn:
-        rows = exec_all(
-            conn,
-            """
-            SELECT role, content AS text, created_at
-            FROM chat_messages
-            WHERE session_id=%s
-            ORDER BY created_at ASC
-            LIMIT 200
-            """,
-            (session_id,),
-        )
-    return {"session_id": session_id, "messages": rows or []}
+        try:
+            out = kb_insert_article(conn, req)
+            conn.commit()
+            return {"ok": True, "article": out}
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to create article: {e}")
 
 
 # =========================
