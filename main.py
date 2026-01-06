@@ -254,17 +254,18 @@ def get_session(conn, session_id: str) -> Dict[str, Any]:
 def log_message(conn, session_id: str, role: str, text: str):
     exec_no_return(
         conn,
-        "INSERT INTO chat_messages (id, session_id, role, text) VALUES (%s, %s, %s, %s)",
+        "INSERT INTO chat_messages (id, session_id, role, content) VALUES (%s, %s, %s, %s)",
         (str(uuid.uuid4()), session_id, role, text),
     )
 
 
-def get_recent_messages(conn, session_id: str, limit: int = 20) -> List[Dict[str, Any]]:
+def get_recent_messages(conn, session_id: str, limit: int = 20):
     return exec_all(
         conn,
-        "SELECT role, text FROM chat_messages WHERE session_id=%s ORDER BY created_at ASC LIMIT %s",
+        "SELECT role, content AS text FROM chat_messages WHERE session_id=%s ORDER BY created_at ASC LIMIT %s",
         (session_id, limit),
     )
+
 
 
 # =========================
