@@ -607,7 +607,7 @@ def admin_livechat_send(
     return {"ok": True, "conversation_id": req.conversation_id, "message": msg}
 
 
-# @app.exception_handler(Exception)
-# async function_exception_handler(request: Request, exc: Exception):
-#     traceback.print_exc()
-#     return JSONResponse(status_code=500, content={"detail": str(exc)})
+@app.exception_handler(Exception)
+async def function_exception_handler(request: Request, exc: Exception):
+    traceback.print_exc()
+    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
