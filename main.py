@@ -3,8 +3,9 @@ import uuid
 import json
 import traceback
 from contextlib import contextmanager
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any, Tuple, Set
 from urllib.parse import urlencode
+from collections import deque
 
 import psycopg
 from psycopg.rows import dict_row
@@ -75,7 +76,10 @@ def clamp01(x: float) -> float:
 # =========================
 def _sb_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-        raise HTTPException(status_code=500, detail="Supabase is not configured (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY).")
+        raise HTTPException(
+            status_code=500,
+            detail="Supabase is not configured (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY).",
+        )
     headers = {
         "apikey": SUPABASE_SERVICE_ROLE_KEY,
         "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
@@ -205,6 +209,7 @@ class OwnerPushTokenRequest(BaseModel):
     expo_push_token: str
 
 
+# ✅ Schema-aligned admin article payload (matches your admin.tsx POST)
 class AdminArticleRequest(BaseModel):
     title: str
     category: str = "General"
@@ -213,19 +218,157 @@ class AdminArticleRequest(BaseModel):
     years_max: int = 2025
 
     customer_summary: str
-    staff_summary: Optional[str] = ""
 
-    # Optional structured fields (if your kb_articles has columns for them, we’ll store them)
-    symptoms: Optional[List[str]] = None
-    likely_causes: Optional[List[str]] = None
-    diagnostics: Optional[List[str]] = None
-    steps: Optional[List[str]] = None
-    tools: Optional[List[str]] = None
-    parts: Optional[List[str]] = None
-    safety_notes: Optional[List[str]] = None
+    # These exist in your table, but when decision_tree is present they will be derived
+    clarifying_questions: Optional[Any] = None  # jsonb
+    steps: Optional[Any] = None  # jsonb
+    model_year_notes: Optional[Any] = None  # jsonb
+    stop_and_escalate: Optional[Any] = None  # jsonb
+    next_step: Optional[str] = None  # text
 
-    # Optional decision tree object
-    decision_tree: Optional[Dict[str, Any]] = None
+    retrieval_text: Optional[str] = None  # text
+
+    # Canonical authored logic:
+    decision_tree: Optional[Dict[str, Any]] = None  # jsonb
+
+
+# =========================
+# Decision-tree derivation helpers
+# =========================
+END_TARGETS = {"end_done", "end_escalate", "end_not_applicable"}
+
+
+def _dt_get_nodes(tree: Dict[str, Any]) -> Dict[str, Any]:
+    nodes = tree.get("nodes")
+    if not isinstance(nodes, dict):
+        return {}
+    return nodes
+
+
+def _dt_get_start(tree: Dict[str, Any]) -> str:
+    start = tree.get("start")
+    return start if isinstance(start, str) else ""
+
+
+def _dt_node_question_text(node: Dict[str, Any]) -> str:
+    title = (node.get("title") or "").strip()
+    body = (node.get("body") or "").strip()
+    if title and body:
+        return f"{title} — {body}"
+    return title or body
+
+
+def derive_from_decision_tree(tree: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Canonical rule:
+      If decision_tree exists, it becomes the SINGLE source of truth.
+
+    Returns:
+      clarifying_questions: List[str]
+      steps: List[str]
+      next_step: Optional[str]
+    """
+    nodes = _dt_get_nodes(tree)
+    start = _dt_get_start(tree)
+
+    if not start or start not in nodes:
+        # Can't derive reliably
+        return {"clarifying_questions": [], "steps": [], "next_step": None}
+
+    # 1) Clarifying questions: root question (single best first question)
+    root_node = nodes.get(start) or {}
+    root_q = _dt_node_question_text(root_node).strip()
+    clarifying_questions: List[str] = [root_q] if root_q else []
+
+    # 2) Steps: flatten reachable nodes (BFS), keeping them stable-ish for retrieval
+    steps: List[str] = []
+    visited: Set[str] = set()
+    q = deque([start])
+
+    while q:
+        nid = q.popleft()
+        if nid in visited:
+            continue
+        visited.add(nid)
+
+        node = nodes.get(nid) or {}
+        qtext = _dt_node_question_text(node).strip()
+        if qtext:
+            steps.append(qtext)
+
+        opts = node.get("options") or []
+        if isinstance(opts, list):
+            for o in opts:
+                if not isinstance(o, dict):
+                    continue
+                goto = (o.get("goto") or "").strip()
+                if not goto or goto in END_TARGETS:
+                    continue
+                if goto in nodes and goto not in visited:
+                    q.append(goto)
+
+    # 3) next_step: simple deterministic fallback based on whether tree contains an escalate end
+    next_step: Optional[str] = None
+    saw_escalate = False
+    saw_done = False
+
+    for nid, node in nodes.items():
+        opts = node.get("options") or []
+        if not isinstance(opts, list):
+            continue
+        for o in opts:
+            if not isinstance(o, dict):
+                continue
+            goto = (o.get("goto") or "").strip()
+            if goto == "end_escalate":
+                saw_escalate = True
+            elif goto == "end_done":
+                saw_done = True
+
+    if saw_escalate:
+        next_step = "request_help"
+    elif saw_done:
+        next_step = "issue_resolved"
+
+    return {"clarifying_questions": clarifying_questions, "steps": steps, "next_step": next_step}
+
+
+def build_retrieval_text(payload: Dict[str, Any]) -> str:
+    parts: List[str] = []
+    parts.append(f"Title: {payload.get('title','')}")
+    parts.append(f"Category: {payload.get('category','')}")
+    parts.append(f"Severity: {payload.get('severity','')}")
+    parts.append(f"Years: {payload.get('years_min','')}-{payload.get('years_max','')}")
+    parts.append(f"Customer Summary: {payload.get('customer_summary','')}")
+
+    ns = (payload.get("next_step") or "").strip()
+    if ns:
+        parts.append(f"Next Step: {ns}")
+
+    cq = payload.get("clarifying_questions")
+    if isinstance(cq, list) and cq:
+        parts.append("Clarifying Questions: " + " | ".join(str(x) for x in cq if str(x).strip()))
+
+    st = payload.get("steps")
+    if isinstance(st, list) and st:
+        parts.append("Steps: " + " | ".join(str(x) for x in st if str(x).strip()))
+    elif st is not None:
+        # keep structure searchable
+        parts.append("Steps(JSON): " + json.dumps(st))
+
+    my = payload.get("model_year_notes")
+    if my is not None:
+        parts.append("Model Year Notes(JSON): " + json.dumps(my))
+
+    sae = payload.get("stop_and_escalate")
+    if sae is not None:
+        parts.append("Stop and Escalate(JSON): " + json.dumps(sae))
+
+    dt = payload.get("decision_tree")
+    if dt is not None:
+        parts.append("Decision Tree(JSON): " + json.dumps(dt))
+
+    return "\n".join(parts).strip()
 
 
 # =========================
@@ -288,7 +431,6 @@ def get_recent_messages(conn, session_id: str, limit: int = 20):
         "SELECT role, content AS text FROM chat_messages WHERE session_id=%s ORDER BY created_at ASC LIMIT %s",
         (session_id, limit),
     )
-
 
 
 # =========================
@@ -357,8 +499,6 @@ def keyword_kb_articles(conn, query_text: str, year: Optional[int], category: Op
     return [(r, 0.95) for r in rows]
 
 
-
-
 # =========================
 # KB admin helpers
 # =========================
@@ -384,56 +524,57 @@ def _vector_literal(vec: List[float]) -> str:
     return "[" + ",".join(f"{float(x):.8f}" for x in vec) + "]"
 
 
-def _kb_build_embed_text(payload: Dict[str, Any]) -> str:
-    # Build a single text blob we embed. Keep it stable and useful for semantic search.
-    parts: List[str] = []
-    parts.append(f"TITLE: {payload.get('title','')}")
-    parts.append(f"CATEGORY: {payload.get('category','')}")
-    parts.append(f"SEVERITY: {payload.get('severity','')}")
-    parts.append(f"YEARS: {payload.get('years_min','')} - {payload.get('years_max','')}")
-    if payload.get("customer_summary"):
-        parts.append("CUSTOMER_SUMMARY:\n" + str(payload["customer_summary"]))
-    if payload.get("staff_summary"):
-        parts.append("STAFF_SUMMARY:\n" + str(payload["staff_summary"]))
-    for key in ["symptoms", "likely_causes", "diagnostics", "steps", "tools", "parts", "safety_notes"]:
-        arr = payload.get(key)
-        if isinstance(arr, list) and arr:
-            parts.append(key.upper() + ":\n" + "\n".join(str(x) for x in arr))
-    if payload.get("decision_tree") is not None:
-        parts.append("DECISION_TREE_JSON:\n" + json.dumps(payload["decision_tree"]))
-    return "\n\n".join(parts).strip()
-
-
 def kb_insert_article(conn, req: AdminArticleRequest) -> Dict[str, Any]:
+    """
+    IMPORTANT:
+      If req.decision_tree is present, we derive clarifying_questions/steps/next_step from it,
+      and ignore client-provided duplicates.
+    """
     cols = _get_kb_columns(conn)
-
     article_id = str(uuid.uuid4())
 
+    # Base payload
     payload: Dict[str, Any] = {
         "id": article_id,
-        "title": req.title.strip(),
-        "category": req.category.strip(),
-        "severity": req.severity.strip(),
+        "title": (req.title or "").strip(),
+        "category": (req.category or "").strip(),
+        "severity": (req.severity or "").strip(),
         "years_min": int(req.years_min),
         "years_max": int(req.years_max),
         "customer_summary": (req.customer_summary or "").strip(),
-        "staff_summary": (req.staff_summary or "").strip(),
         "decision_tree": req.decision_tree,
-        "symptoms": req.symptoms,
-        "likely_causes": req.likely_causes,
-        "diagnostics": req.diagnostics,
-        "steps": req.steps,
-        "tools": req.tools,
-        "parts": req.parts,
-        "safety_notes": req.safety_notes,
+        "model_year_notes": req.model_year_notes,
+        "stop_and_escalate": req.stop_and_escalate,
     }
 
-    # Compute embedding from a stable “document”
-    doc_text = _kb_build_embed_text(payload)
+    # Derive (decision_tree -> canonical)
+    if isinstance(req.decision_tree, dict) and req.decision_tree:
+        derived = derive_from_decision_tree(req.decision_tree)
+        payload["clarifying_questions"] = derived.get("clarifying_questions") or []
+        payload["steps"] = derived.get("steps") or []
+        payload["next_step"] = derived.get("next_step")
+    else:
+        # Backward compat: accept client-provided values if no decision tree
+        payload["clarifying_questions"] = req.clarifying_questions
+        payload["steps"] = req.steps
+        payload["next_step"] = (req.next_step or "").strip() or None
+
+    # Retrieval text: if provided, keep it, but ensure tree is included; else auto-build
+    provided_rt = (req.retrieval_text or "").strip()
+    payload_for_rt = {
+        **payload,
+        "clarifying_questions": payload.get("clarifying_questions"),
+        "steps": payload.get("steps"),
+        "next_step": payload.get("next_step"),
+    }
+    auto_rt = build_retrieval_text(payload_for_rt)
+    payload["retrieval_text"] = provided_rt or auto_rt
+
+    # Compute embedding from retrieval_text (stable + includes the tree)
+    doc_text = payload["retrieval_text"] or auto_rt
     emb = embed_text(doc_text)
     emb_literal = _vector_literal(emb)
 
-    # Build INSERT dynamically based on actual columns present
     insert_cols: List[str] = []
     insert_vals: List[str] = []
     params: List[Any] = []
@@ -444,6 +585,13 @@ def kb_insert_article(conn, req: AdminArticleRequest) -> Dict[str, Any]:
             insert_vals.append("%s")
             params.append(val)
 
+    def add_json(col: str, val: Any):
+        if col in cols:
+            insert_cols.append(col)
+            insert_vals.append("%s")
+            params.append(json.dumps(val) if val is not None else None)
+
+    # Required-ish text fields
     add("id", payload["id"])
     add("title", payload["title"])
     add("category", payload["category"])
@@ -451,13 +599,17 @@ def kb_insert_article(conn, req: AdminArticleRequest) -> Dict[str, Any]:
     add("years_min", payload["years_min"])
     add("years_max", payload["years_max"])
     add("customer_summary", payload["customer_summary"])
-    add("staff_summary", payload["staff_summary"])
-    # decision_tree is commonly jsonb; we pass a JSON string (Postgres will cast if needed)
-    add("decision_tree", json.dumps(payload["decision_tree"]) if payload["decision_tree"] is not None else None)
 
-    # Optional list fields (only if the columns exist)
-    for col in ["symptoms", "likely_causes", "diagnostics", "steps", "tools", "parts", "safety_notes"]:
-        add(col, payload[col])
+    # Derived/optional schema fields
+    add_json("clarifying_questions", payload.get("clarifying_questions"))
+    add_json("steps", payload.get("steps"))
+    add_json("model_year_notes", payload.get("model_year_notes"))
+    add_json("stop_and_escalate", payload.get("stop_and_escalate"))
+    add("next_step", payload.get("next_step"))
+    add("retrieval_text", payload.get("retrieval_text"))
+
+    # Decision tree is jsonb
+    add_json("decision_tree", payload.get("decision_tree"))
 
     # embedding (pgvector)
     if "embedding" in cols:
@@ -471,7 +623,6 @@ def kb_insert_article(conn, req: AdminArticleRequest) -> Dict[str, Any]:
     sql = f"INSERT INTO kb_articles ({', '.join(insert_cols)}) VALUES ({', '.join(insert_vals)}) RETURNING id, title"
     row = exec_one(conn, sql, tuple(params))
     return {"id": (row or {}).get("id", article_id), "title": (row or {}).get("title", payload["title"])}
-
 
 
 # =========================
@@ -542,7 +693,6 @@ def create_session(req: CreateSessionRequest):
     sid = str(uuid.uuid4())
     with db() as conn:
         if req.reset_old_session_id:
-            # Optionally wipe old session messages if you want.
             if req.delete_old_messages:
                 exec_no_return(conn, "DELETE FROM chat_messages WHERE session_id=%s", (req.reset_old_session_id,))
             exec_no_return(conn, "DELETE FROM sessions WHERE id=%s", (req.reset_old_session_id,))
@@ -565,7 +715,11 @@ def session_exists(session_id: str):
 def update_context(session_id: str, req: UpdateContextRequest):
     with db() as conn:
         get_session(conn, session_id)
-        exec_no_return(conn, "UPDATE sessions SET airstream_year=%s, category=%s WHERE id=%s", (req.airstream_year, req.category, session_id))
+        exec_no_return(
+            conn,
+            "UPDATE sessions SET airstream_year=%s, category=%s WHERE id=%s",
+            (req.airstream_year, req.category, session_id),
+        )
         conn.commit()
     return {"ok": True}
 
@@ -601,8 +755,8 @@ def chat(req: ChatRequest):
                 show_escalation=False,
                 message_id=str(uuid.uuid4()),
             )
-        
-                # DB-first: try keyword/title match first (works even if embeddings are NULL)
+
+        # ✅ DB-first: try keyword/title match first (works even if embeddings are NULL)
         ranked = keyword_kb_articles(conn, req.message, year, category, top_k=6)
 
         # If no keyword hits, try vector search (requires embeddings)
@@ -614,7 +768,6 @@ def chat(req: ChatRequest):
         context_chunks: List[str] = []
         used_articles: List[Dict[str, str]] = []
         for r, score in ranked:
-            # Keyword hits come in at 0.95; vector hits must clear a small threshold
             if score < 0.15:
                 continue
 
@@ -631,17 +784,6 @@ def chat(req: ChatRequest):
 
         from_kb = len(context_chunks) > 0
 
-
-        # q_emb = embed(req.message)
-        # ranked = rank_kb_articles(conn, q_emb, year, category, top_k=6)
-
-        # used_articles = [{"id": r["id"], "title": r["title"]} for r, _ in ranked]
-        # context_chunks = []
-        # for r, score in ranked:
-        #     if score < 0.25:
-        #         continue
-        #     context_chunks.append(f"TITLE: {r['title']}\nBODY:\n{r['body']}")
-
         history = get_recent_messages(conn, req.session_id, limit=20)
 
         try:
@@ -654,12 +796,8 @@ def chat(req: ChatRequest):
                 history=history,
             )
             if not from_kb:
-                answer = (
-                    "⚠️ This information is NOT from Vinnies Brain’s database.\n\n"
-                    + answer
-                )
-            confidence = min(confidence, 0.45)
- 
+                answer = "⚠️ This information is NOT from Vinnies Brain’s database.\n\n" + answer
+                confidence = min(confidence, 0.45)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"LLM error: {e}")
 
@@ -684,7 +822,6 @@ def chat(req: ChatRequest):
 @app.post("/v1/escalations", response_model=EscalationResponse)
 def create_escalation(req: EscalationRequest):
     ticket_id = str(uuid.uuid4())
-    # Keep your existing escalation handling here (email/ticket/etc.)
     return {"ticket_id": ticket_id}
 
 
@@ -730,10 +867,8 @@ def livechat_history(session_id: str):
     return {"conversation_id": conv_id, "messages": rows or []}
 
 
-
-
 # =========================
-# Admin KB article create (good-enough version)
+# Admin KB article create
 # =========================
 @app.post("/v1/admin/articles")
 def admin_create_article(
@@ -840,6 +975,6 @@ def admin_livechat_send(
 
 
 # @app.exception_handler(Exception)
-# async function_exception_handler(request: Request, exc: Exception):
+# async def function_exception_handler(request: Request, exc: Exception):
 #     traceback.print_exc()
 #     return JSONResponse(status_code=500, content={"detail": str(exc)})
