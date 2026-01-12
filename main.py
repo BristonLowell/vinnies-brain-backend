@@ -299,12 +299,12 @@ def embed(text: str) -> List[float]:
 
 
 def rank_kb_articles(conn, query_embedding: List[float], year: Optional[int], category: Optional[str], top_k: int = 6):
-    # ✅ FIX: your kb_articles table doesn't have "body"; use customer_summary as body
+    # Vector search (requires embeddings to be present)
     sql = """
-    SELECT id, title, customer_summary AS body,
+    SELECT id, title, customer_summary AS body, retrieval_text,
            1 - (embedding <=> %s::vector) AS score
       FROM kb_articles
-     WHERE 1=1
+     WHERE embedding IS NOT NULL
     """
     params: List[Any] = [query_embedding]
 
@@ -322,6 +322,41 @@ def rank_kb_articles(conn, query_embedding: List[float], year: Optional[int], ca
 
     rows = exec_all(conn, sql, tuple(params))
     return [(r, clamp01(float(r["score"]))) for r in rows]
+
+
+def keyword_kb_articles(conn, query_text: str, year: Optional[int], category: Optional[str], top_k: int = 6):
+    # Text match search (works even if embeddings are NULL)
+    q = (query_text or "").strip()
+    if not q:
+        return []
+
+    sql = """
+    SELECT id, title, customer_summary AS body, retrieval_text
+      FROM kb_articles
+     WHERE (
+        title ILIKE %s
+        OR COALESCE(retrieval_text, '') ILIKE %s
+        OR COALESCE(customer_summary, '') ILIKE %s
+     )
+    """
+    params: List[Any] = [f"%{q}%", f"%{q}%", f"%{q}%"]
+
+    if year is not None:
+        sql += " AND years_min <= %s AND years_max >= %s"
+        params.extend([year, year])
+
+    if category:
+        sql += " AND category = %s"
+        params.append(category)
+
+    sql += " LIMIT %s"
+    params.append(top_k)
+
+    rows = exec_all(conn, sql, tuple(params))
+    # Give keyword hits a strong pseudo-score so they reliably make it into context
+    return [(r, 0.95) for r in rows]
+
+
 
 
 # =========================
@@ -566,16 +601,46 @@ def chat(req: ChatRequest):
                 show_escalation=False,
                 message_id=str(uuid.uuid4()),
             )
+        
+                # DB-first: try keyword/title match first (works even if embeddings are NULL)
+        ranked = keyword_kb_articles(conn, req.message, year, category, top_k=6)
 
-        q_emb = embed(req.message)
-        ranked = rank_kb_articles(conn, q_emb, year, category, top_k=6)
+        # If no keyword hits, try vector search (requires embeddings)
+        if not ranked:
+            q_emb = embed(req.message)
+            ranked = rank_kb_articles(conn, q_emb, year, category, top_k=6)
 
-        used_articles = [{"id": r["id"], "title": r["title"]} for r, _ in ranked]
-        context_chunks = []
+        # Build KB context (only from rows that pass the threshold)
+        context_chunks: List[str] = []
+        used_articles: List[Dict[str, str]] = []
         for r, score in ranked:
-            if score < 0.25:
+            # Keyword hits come in at 0.95; vector hits must clear a small threshold
+            if score < 0.15:
                 continue
-            context_chunks.append(f"TITLE: {r['title']}\nBODY:\n{r['body']}")
+
+            used_articles.append({"id": r["id"], "title": r["title"]})
+
+            rt = (r.get("retrieval_text") or "").strip()
+            body = (r.get("body") or "").strip()
+
+            chunk = f"TITLE: {r['title']}\n"
+            if rt:
+                chunk += f"RETRIEVAL_TEXT:\n{rt}\n"
+            chunk += f"BODY:\n{body}"
+            context_chunks.append(chunk)
+
+        from_kb = len(context_chunks) > 0
+
+
+        # q_emb = embed(req.message)
+        # ranked = rank_kb_articles(conn, q_emb, year, category, top_k=6)
+
+        # used_articles = [{"id": r["id"], "title": r["title"]} for r, _ in ranked]
+        # context_chunks = []
+        # for r, score in ranked:
+        #     if score < 0.25:
+        #         continue
+        #     context_chunks.append(f"TITLE: {r['title']}\nBODY:\n{r['body']}")
 
         history = get_recent_messages(conn, req.session_id, limit=20)
 
@@ -588,6 +653,13 @@ def chat(req: ChatRequest):
                 category=category,
                 history=history,
             )
+            if not from_kb:
+                answer = (
+                    "⚠️ This information is NOT from Vinnies Brain’s database.\n\n"
+                    + answer
+                )
+            confidence = min(confidence, 0.45)
+ 
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"LLM error: {e}")
 
