@@ -543,8 +543,8 @@ def kb_insert_article(conn, req: AdminArticleRequest) -> Dict[str, Any]:
         "years_max": int(req.years_max),
         "customer_summary": (req.customer_summary or "").strip(),
         "decision_tree": req.decision_tree,
-        "model_year_notes": req.model_year_notes,
-        "stop_and_escalate": req.stop_and_escalate,
+        "model_year_notes": req.model_year_notes if req.model_year_notes is not None else {},
+        "stop_and_escalate": req.stop_and_escalate if req.stop_and_escalate is not None else {},
     }
 
     # Derive (decision_tree -> canonical)
@@ -603,8 +603,9 @@ def kb_insert_article(conn, req: AdminArticleRequest) -> Dict[str, Any]:
     # Derived/optional schema fields
     add_json("clarifying_questions", payload.get("clarifying_questions"))
     add_json("steps", payload.get("steps"))
-    add_json("model_year_notes", payload.get("model_year_notes"))
-    add_json("stop_and_escalate", payload.get("stop_and_escalate"))
+    add_json("model_year_notes", payload.get("model_year_notes") if payload.get("model_year_notes") is not None else {})
+    add_json("stop_and_escalate", payload.get("stop_and_escalate") if payload.get("stop_and_escalate") is not None else {})
+
     add("next_step", payload.get("next_step"))
     add("retrieval_text", payload.get("retrieval_text"))
 
