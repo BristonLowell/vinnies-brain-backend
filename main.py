@@ -410,6 +410,27 @@ def require_admin(x_admin_key: str) -> None:
 # =========================
 # DB: sessions + chat log
 # =========================
+_SESS_COLUMNS_CACHE: Optional[set] = None
+
+
+def _get_sessions_columns(conn) -> set:
+    global _SESS_COLUMNS_CACHE
+    if _SESS_COLUMNS_CACHE is not None:
+        return _SESS_COLUMNS_CACHE
+    rows = exec_all(
+        conn,
+        "SELECT column_name FROM information_schema.columns WHERE table_name='sessions'",
+        (),
+    )
+    _SESS_COLUMNS_CACHE = {r["column_name"] for r in (rows or []) if r.get("column_name")}
+    return _SESS_COLUMNS_CACHE
+
+
+def sessions_supports_pinning(conn) -> bool:
+    cols = _get_sessions_columns(conn)
+    return {"active_article_id", "active_node_id", "active_tree"}.issubset(cols)
+
+
 def get_session(conn, session_id: str) -> Dict[str, Any]:
     row = exec_one(conn, "SELECT * FROM sessions WHERE id=%s", (session_id,))
     if not row:
@@ -425,12 +446,108 @@ def log_message(conn, session_id: str, role: str, text: str):
     )
 
 
-def get_recent_messages(conn, session_id: str, limit: int = 20):
+def get_recent_messages(conn, session_id: str, limit: int = 200):
+    # use ASC so admin can see full progress in order
     return exec_all(
         conn,
-        "SELECT role, content AS text FROM chat_messages WHERE session_id=%s ORDER BY created_at ASC LIMIT %s",
+        "SELECT role, content AS text, created_at FROM chat_messages WHERE session_id=%s ORDER BY created_at ASC LIMIT %s",
         (session_id, limit),
     )
+
+
+# =========================
+# Pinned-flow helpers (prevents topic jumps)
+# =========================
+YES_NO_MAP = {
+    "y": "yes",
+    "yes": "yes",
+    "yeah": "yes",
+    "yep": "yes",
+    "yup": "yes",
+    "sure": "yes",
+    "ok": "yes",
+    "okay": "yes",
+    "n": "no",
+    "no": "no",
+    "nope": "no",
+    "nah": "no",
+}
+
+
+def normalize_yes_no(text: str) -> Optional[str]:
+    t = (text or "").strip().lower()
+    if t in YES_NO_MAP:
+        return YES_NO_MAP[t]
+    return None
+
+
+def _opt_answer_key(opt: Dict[str, Any]) -> str:
+    # Support multiple schemas: answer/value/label/text
+    for k in ("answer", "value", "label", "text"):
+        v = opt.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip().lower()
+    return ""
+
+
+def advance_node(tree: Dict[str, Any], node_id: str, user_answer: str) -> str:
+    """
+    Moves within the decision_tree based on a yes/no answer.
+    Returns next node id (or same if it can't advance).
+    """
+    try:
+        nodes = tree.get("nodes") or {}
+        if not isinstance(nodes, dict):
+            return node_id
+        node = nodes.get(node_id) or {}
+        opts = node.get("options") or []
+        if not isinstance(opts, list):
+            return node_id
+
+        ua = normalize_yes_no(user_answer)
+        if not ua:
+            return node_id
+
+        for opt in opts:
+            if not isinstance(opt, dict):
+                continue
+            key = _opt_answer_key(opt)
+            goto = (opt.get("goto") or "").strip()
+            if not goto:
+                continue
+            if key in {ua, "yes/no", "true/false"}:
+                # If "yes/no", we can't decide; only accept direct matches
+                if key in {"yes/no", "true/false"}:
+                    continue
+                return goto
+
+        # also allow "true"/"false" schemas
+        for opt in opts:
+            if not isinstance(opt, dict):
+                continue
+            key = _opt_answer_key(opt)
+            goto = (opt.get("goto") or "").strip()
+            if not goto:
+                continue
+            if ua == "yes" and key in {"true", "t", "1"}:
+                return goto
+            if ua == "no" and key in {"false", "f", "0"}:
+                return goto
+
+        return node_id
+    except Exception:
+        return node_id
+
+
+def node_text(tree: Dict[str, Any], node_id: str) -> str:
+    nodes = _dt_get_nodes(tree)
+    node = nodes.get(node_id) or {}
+    return _dt_node_question_text(node).strip()
+
+
+def should_reset_flow(message: str) -> bool:
+    t = (message or "").lower()
+    return any(p in t for p in ["new issue", "different issue", "different problem", "switch topic", "switch topics", "reset"])
 
 
 # =========================
@@ -442,8 +559,12 @@ def embed(text: str) -> List[float]:
 
 def rank_kb_articles(conn, query_embedding: List[float], year: Optional[int], category: Optional[str], top_k: int = 6):
     # Vector search (requires embeddings to be present)
+    # NOTE: include decision_tree so we can pin it.
     sql = """
-    SELECT id, title, customer_summary AS body, retrieval_text,
+    SELECT id, title,
+           customer_summary AS body,
+           retrieval_text,
+           decision_tree,
            1 - (embedding <=> %s::vector) AS score
       FROM kb_articles
      WHERE embedding IS NOT NULL
@@ -473,7 +594,10 @@ def keyword_kb_articles(conn, query_text: str, year: Optional[int], category: Op
         return []
 
     sql = """
-    SELECT id, title, customer_summary AS body, retrieval_text
+    SELECT id, title,
+           customer_summary AS body,
+           retrieval_text,
+           decision_tree
       FROM kb_articles
      WHERE (
         title ILIKE %s
@@ -725,6 +849,61 @@ def update_context(session_id: str, req: UpdateContextRequest):
     return {"ok": True}
 
 
+# -------------------------
+# Admin: AI troubleshooting progress for a session
+# - This returns the AI+user messages from chat_messages (your progress log)
+# - Also includes pinned article/tree/node state if enabled
+# -------------------------
+def _admin_ai_history_payload(conn, session_id: str) -> Dict[str, Any]:
+    sess = get_session(conn, session_id)
+    msgs = get_recent_messages(conn, session_id, limit=500)
+
+    # Convert to the shape your admin-chat.tsx expects: [{role, text, created_at}]
+    out_msgs = []
+    for m in (msgs or []):
+        role = (m.get("role") or "").strip()
+        text = (m.get("text") or "").strip()
+        if not role or not text:
+            continue
+        out_msgs.append(
+            {
+                "role": role,
+                "text": text,
+                "created_at": m.get("created_at"),
+            }
+        )
+
+    payload: Dict[str, Any] = {"session_id": session_id, "messages": out_msgs}
+
+    if sessions_supports_pinning(conn):
+        payload["active_article_id"] = sess.get("active_article_id")
+        payload["active_node_id"] = sess.get("active_node_id")
+        tree = sess.get("active_tree")
+        if isinstance(tree, str):
+            try:
+                tree = json.loads(tree)
+            except Exception:
+                tree = None
+        payload["active_tree_present"] = bool(tree)
+        if isinstance(tree, dict) and sess.get("active_node_id"):
+            payload["active_node_text"] = node_text(tree, sess.get("active_node_id"))
+
+    return payload
+
+
+# Your AdminChat currently calls: `${API_BASE_URL}/admin/ai-history/${customerId}`
+# This adds that route (no /v1) AND keeps the /v1 route for consistency.
+@app.get("/admin/ai-history/{session_id}")
+@app.get("/v1/admin/ai-history/{session_id}")
+def admin_ai_history(session_id: str, x_admin_key: str = Header(default="", alias="X-Admin-Key")):
+    require_admin(x_admin_key)
+    with db() as conn:
+        return _admin_ai_history_payload(conn, session_id)
+
+
+# -------------------------
+# Chat (Pinned-flow enabled)
+# -------------------------
 @app.post("/v1/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
     with db() as conn:
@@ -757,35 +936,138 @@ def chat(req: ChatRequest):
                 message_id=str(uuid.uuid4()),
             )
 
-        # ✅ DB-first: try keyword/title match first (works even if embeddings are NULL)
-        ranked = keyword_kb_articles(conn, req.message, year, category, top_k=6)
+        # --- pinned flow state (if schema supports it) ---
+        pin_supported = sessions_supports_pinning(conn)
 
-        # If no keyword hits, try vector search (requires embeddings)
-        if not ranked:
-            q_emb = embed(req.message)
-            ranked = rank_kb_articles(conn, q_emb, year, category, top_k=6)
+        active_article_id = sess.get("active_article_id") if pin_supported else None
+        active_node_id = sess.get("active_node_id") if pin_supported else None
+        active_tree = sess.get("active_tree") if pin_supported else None
 
-        # Build KB context (only from rows that pass the threshold)
-        context_chunks: List[str] = []
+        # reset flow if user explicitly asks to switch/reset
+        if pin_supported and should_reset_flow(req.message):
+            exec_no_return(
+                conn,
+                "UPDATE sessions SET active_article_id=NULL, active_node_id=NULL, active_tree=NULL WHERE id=%s",
+                (req.session_id,),
+            )
+            conn.commit()
+            active_article_id = None
+            active_node_id = None
+            active_tree = None
+
+        # decode active_tree if stored as string
+        if isinstance(active_tree, str):
+            try:
+                active_tree = json.loads(active_tree)
+            except Exception:
+                active_tree = None
+
+        # Detect if this user message is a short yes/no
+        yn = normalize_yes_no(req.message)
+
+        # If we have an active pinned tree and the user replied yes/no, advance node and SKIP retrieval
+        use_pinned = bool(pin_supported and active_article_id and isinstance(active_tree, dict) and active_node_id and yn)
+
         used_articles: List[Dict[str, str]] = []
-        for r, score in ranked:
-            if score < 0.15:
-                continue
+        context_chunks: List[str] = []
+        from_kb = False
 
-            used_articles.append({"id": r["id"], "title": r["title"]})
+        if use_pinned:
+            # advance decision tree
+            next_node = advance_node(active_tree, active_node_id, req.message)
 
-            rt = (r.get("retrieval_text") or "").strip()
-            body = (r.get("body") or "").strip()
+            # update session node
+            exec_no_return(
+                conn,
+                "UPDATE sessions SET active_node_id=%s WHERE id=%s",
+                (next_node, req.session_id),
+            )
 
-            chunk = f"TITLE: {r['title']}\n"
-            if rt:
-                chunk += f"RETRIEVAL_TEXT:\n{rt}\n"
-            chunk += f"BODY:\n{body}"
-            context_chunks.append(chunk)
+            # Build context from the pinned article only
+            row = exec_one(
+                conn,
+                """
+                SELECT id, title, customer_summary AS body, retrieval_text, decision_tree
+                  FROM kb_articles
+                 WHERE id=%s
+                """,
+                (active_article_id,),
+            )
 
-        from_kb = len(context_chunks) > 0
+            if row:
+                used_articles.append({"id": row["id"], "title": row["title"]})
+                rt = (row.get("retrieval_text") or "").strip()
+                body = (row.get("body") or "").strip()
+                tree = row.get("decision_tree")
 
-        history = get_recent_messages(conn, req.session_id, limit=20)
+                chunk = f"TITLE: {row['title']}\n"
+                if rt:
+                    chunk += f"RETRIEVAL_TEXT:\n{rt}\n"
+                chunk += f"BODY:\n{body}\n\n"
+
+                # Provide explicit active-node context to prevent the model from “freewheeling”
+                if isinstance(tree, dict) and next_node:
+                    qtext = node_text(tree, next_node)
+                    if qtext:
+                        chunk += f"ACTIVE_TROUBLESHOOTING_NODE:\n{next_node}\nQUESTION:\n{qtext}\n"
+
+                context_chunks.append(chunk)
+                from_kb = True
+
+            # refresh sess for accurate state later (optional)
+            sess = get_session(conn, req.session_id)
+
+        else:
+            # ✅ DB-first: try keyword/title match first (works even if embeddings are NULL)
+            ranked = keyword_kb_articles(conn, req.message, year, category, top_k=6)
+
+            # If no keyword hits, try vector search (requires embeddings)
+            if not ranked:
+                q_emb = embed(req.message)
+                ranked = rank_kb_articles(conn, q_emb, year, category, top_k=6)
+
+            # Build KB context (only from rows that pass the threshold)
+            for r, score in ranked:
+                if score < 0.15:
+                    continue
+
+                used_articles.append({"id": r["id"], "title": r["title"]})
+
+                rt = (r.get("retrieval_text") or "").strip()
+                body = (r.get("body") or "").strip()
+
+                chunk = f"TITLE: {r['title']}\n"
+                if rt:
+                    chunk += f"RETRIEVAL_TEXT:\n{rt}\n"
+                chunk += f"BODY:\n{body}"
+                context_chunks.append(chunk)
+
+            from_kb = len(context_chunks) > 0
+
+            # If we found a KB article and pinning is supported, pin the top article/tree
+            if pin_supported and from_kb and ranked:
+                top = ranked[0][0]
+                tree = top.get("decision_tree")
+                if isinstance(tree, dict) and tree.get("start") and tree.get("nodes"):
+                    exec_no_return(
+                        conn,
+                        """
+                        UPDATE sessions
+                           SET active_article_id=%s,
+                               active_tree=%s,
+                               active_node_id=%s
+                         WHERE id=%s
+                        """,
+                        (
+                            top["id"],
+                            json.dumps(tree),
+                            tree.get("start"),
+                            req.session_id,
+                        ),
+                    )
+                    # no commit yet; we'll commit at end
+
+        history = get_recent_messages(conn, req.session_id, limit=50)
 
         try:
             answer, clarifying, confidence = generate_answer(
