@@ -209,7 +209,6 @@ class OwnerPushTokenRequest(BaseModel):
     expo_push_token: str
 
 
-# ✅ Schema-aligned admin article payload (matches your admin.tsx POST)
 class AdminArticleRequest(BaseModel):
     title: str
     category: str = "General"
@@ -219,7 +218,6 @@ class AdminArticleRequest(BaseModel):
 
     customer_summary: str
 
-    # These exist in your table, but when decision_tree is present they will be derived
     clarifying_questions: Optional[Any] = None  # jsonb
     steps: Optional[Any] = None  # jsonb
     model_year_notes: Optional[Any] = None  # jsonb
@@ -228,12 +226,11 @@ class AdminArticleRequest(BaseModel):
 
     retrieval_text: Optional[str] = None  # text
 
-    # Canonical authored logic:
     decision_tree: Optional[Dict[str, Any]] = None  # jsonb
 
 
 # =========================
-# Decision-tree derivation helpers
+# Decision-tree helpers
 # =========================
 END_TARGETS = {"end_done", "end_escalate", "end_not_applicable"}
 
@@ -259,28 +256,16 @@ def _dt_node_question_text(node: Dict[str, Any]) -> str:
 
 
 def derive_from_decision_tree(tree: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Canonical rule:
-      If decision_tree exists, it becomes the SINGLE source of truth.
-
-    Returns:
-      clarifying_questions: List[str]
-      steps: List[str]
-      next_step: Optional[str]
-    """
     nodes = _dt_get_nodes(tree)
     start = _dt_get_start(tree)
 
     if not start or start not in nodes:
-        # Can't derive reliably
         return {"clarifying_questions": [], "steps": [], "next_step": None}
 
-    # 1) Clarifying questions: root question (single best first question)
     root_node = nodes.get(start) or {}
     root_q = _dt_node_question_text(root_node).strip()
     clarifying_questions: List[str] = [root_q] if root_q else []
 
-    # 2) Steps: flatten reachable nodes (BFS), keeping them stable-ish for retrieval
     steps: List[str] = []
     visited: Set[str] = set()
     q = deque([start])
@@ -307,12 +292,11 @@ def derive_from_decision_tree(tree: Dict[str, Any]) -> Dict[str, Any]:
                 if goto in nodes and goto not in visited:
                     q.append(goto)
 
-    # 3) next_step: simple deterministic fallback based on whether tree contains an escalate end
     next_step: Optional[str] = None
     saw_escalate = False
     saw_done = False
 
-    for nid, node in nodes.items():
+    for _, node in nodes.items():
         opts = node.get("options") or []
         if not isinstance(opts, list):
             continue
@@ -353,7 +337,6 @@ def build_retrieval_text(payload: Dict[str, Any]) -> str:
     if isinstance(st, list) and st:
         parts.append("Steps: " + " | ".join(str(x) for x in st if str(x).strip()))
     elif st is not None:
-        # keep structure searchable
         parts.append("Steps(JSON): " + json.dumps(st))
 
     my = payload.get("model_year_notes")
@@ -431,6 +414,14 @@ def sessions_supports_pinning(conn) -> bool:
     return {"active_article_id", "active_node_id", "active_tree"}.issubset(cols)
 
 
+<<<<<<< HEAD
+=======
+def sessions_supports_active_question(conn) -> bool:
+    cols = _get_sessions_columns(conn)
+    return "active_question_text" in cols
+
+
+>>>>>>> 53b9939 (changes)
 def get_session(conn, session_id: str) -> Dict[str, Any]:
     row = exec_one(conn, "SELECT * FROM sessions WHERE id=%s", (session_id,))
     if not row:
@@ -447,7 +438,10 @@ def log_message(conn, session_id: str, role: str, text: str):
 
 
 def get_recent_messages(conn, session_id: str, limit: int = 200):
+<<<<<<< HEAD
     # use ASC so admin can see full progress in order
+=======
+>>>>>>> 53b9939 (changes)
     return exec_all(
         conn,
         "SELECT role, content AS text, created_at FROM chat_messages WHERE session_id=%s ORDER BY created_at ASC LIMIT %s",
@@ -456,7 +450,11 @@ def get_recent_messages(conn, session_id: str, limit: int = 200):
 
 
 # =========================
+<<<<<<< HEAD
 # Pinned-flow helpers (prevents topic jumps)
+=======
+# Pinned-flow helpers
+>>>>>>> 53b9939 (changes)
 # =========================
 YES_NO_MAP = {
     "y": "yes",
@@ -482,7 +480,10 @@ def normalize_yes_no(text: str) -> Optional[str]:
 
 
 def _opt_answer_key(opt: Dict[str, Any]) -> str:
+<<<<<<< HEAD
     # Support multiple schemas: answer/value/label/text
+=======
+>>>>>>> 53b9939 (changes)
     for k in ("answer", "value", "label", "text"):
         v = opt.get(k)
         if isinstance(v, str) and v.strip():
@@ -491,10 +492,13 @@ def _opt_answer_key(opt: Dict[str, Any]) -> str:
 
 
 def advance_node(tree: Dict[str, Any], node_id: str, user_answer: str) -> str:
+<<<<<<< HEAD
     """
     Moves within the decision_tree based on a yes/no answer.
     Returns next node id (or same if it can't advance).
     """
+=======
+>>>>>>> 53b9939 (changes)
     try:
         nodes = tree.get("nodes") or {}
         if not isinstance(nodes, dict):
@@ -515,6 +519,7 @@ def advance_node(tree: Dict[str, Any], node_id: str, user_answer: str) -> str:
             goto = (opt.get("goto") or "").strip()
             if not goto:
                 continue
+<<<<<<< HEAD
             if key in {ua, "yes/no", "true/false"}:
                 # If "yes/no", we can't decide; only accept direct matches
                 if key in {"yes/no", "true/false"}:
@@ -522,6 +527,11 @@ def advance_node(tree: Dict[str, Any], node_id: str, user_answer: str) -> str:
                 return goto
 
         # also allow "true"/"false" schemas
+=======
+            if key == ua:
+                return goto
+
+>>>>>>> 53b9939 (changes)
         for opt in opts:
             if not isinstance(opt, dict):
                 continue
@@ -550,16 +560,36 @@ def should_reset_flow(message: str) -> bool:
     return any(p in t for p in ["new issue", "different issue", "different problem", "switch topic", "switch topics", "reset"])
 
 
+<<<<<<< HEAD
 # =========================
 # RAG helpers (existing)
+=======
+def rewrite_short_answer(user_text: str, active_question_text: Optional[str]) -> str:
+    """
+    Makes the meaning explicit for the model.
+    Example: "yes" -> 'Answer to: "<question>" -> yes'
+    """
+    yn = normalize_yes_no(user_text)
+    q = (active_question_text or "").strip()
+    if yn and q:
+        return f'Answer to: "{q}" -> {yn}'
+    return user_text
+
+
+# =========================
+# RAG helpers
+>>>>>>> 53b9939 (changes)
 # =========================
 def embed(text: str) -> List[float]:
     return embed_text(text)
 
 
 def rank_kb_articles(conn, query_embedding: List[float], year: Optional[int], category: Optional[str], top_k: int = 6):
+<<<<<<< HEAD
     # Vector search (requires embeddings to be present)
     # NOTE: include decision_tree so we can pin it.
+=======
+>>>>>>> 53b9939 (changes)
     sql = """
     SELECT id, title,
            customer_summary AS body,
@@ -588,7 +618,6 @@ def rank_kb_articles(conn, query_embedding: List[float], year: Optional[int], ca
 
 
 def keyword_kb_articles(conn, query_text: str, year: Optional[int], category: Optional[str], top_k: int = 6):
-    # Text match search (works even if embeddings are NULL)
     q = (query_text or "").strip()
     if not q:
         return []
@@ -619,12 +648,11 @@ def keyword_kb_articles(conn, query_text: str, year: Optional[int], category: Op
     params.append(top_k)
 
     rows = exec_all(conn, sql, tuple(params))
-    # Give keyword hits a strong pseudo-score so they reliably make it into context
     return [(r, 0.95) for r in rows]
 
 
 # =========================
-# KB admin helpers
+# KB admin helpers (unchanged)
 # =========================
 _KB_COLUMNS_CACHE: Optional[set] = None
 
@@ -644,20 +672,13 @@ def _get_kb_columns(conn) -> set:
 
 
 def _vector_literal(vec: List[float]) -> str:
-    # pgvector accepts a string like: [0.1,0.2,0.3]
     return "[" + ",".join(f"{float(x):.8f}" for x in vec) + "]"
 
 
 def kb_insert_article(conn, req: AdminArticleRequest) -> Dict[str, Any]:
-    """
-    IMPORTANT:
-      If req.decision_tree is present, we derive clarifying_questions/steps/next_step from it,
-      and ignore client-provided duplicates.
-    """
     cols = _get_kb_columns(conn)
     article_id = str(uuid.uuid4())
 
-    # Base payload
     payload: Dict[str, Any] = {
         "id": article_id,
         "title": (req.title or "").strip(),
@@ -671,19 +692,16 @@ def kb_insert_article(conn, req: AdminArticleRequest) -> Dict[str, Any]:
         "stop_and_escalate": req.stop_and_escalate if req.stop_and_escalate is not None else {},
     }
 
-    # Derive (decision_tree -> canonical)
     if isinstance(req.decision_tree, dict) and req.decision_tree:
         derived = derive_from_decision_tree(req.decision_tree)
         payload["clarifying_questions"] = derived.get("clarifying_questions") or []
         payload["steps"] = derived.get("steps") or []
         payload["next_step"] = derived.get("next_step")
     else:
-        # Backward compat: accept client-provided values if no decision tree
         payload["clarifying_questions"] = req.clarifying_questions
         payload["steps"] = req.steps
         payload["next_step"] = (req.next_step or "").strip() or None
 
-    # Retrieval text: if provided, keep it, but ensure tree is included; else auto-build
     provided_rt = (req.retrieval_text or "").strip()
     payload_for_rt = {
         **payload,
@@ -694,7 +712,6 @@ def kb_insert_article(conn, req: AdminArticleRequest) -> Dict[str, Any]:
     auto_rt = build_retrieval_text(payload_for_rt)
     payload["retrieval_text"] = provided_rt or auto_rt
 
-    # Compute embedding from retrieval_text (stable + includes the tree)
     doc_text = payload["retrieval_text"] or auto_rt
     emb = embed_text(doc_text)
     emb_literal = _vector_literal(emb)
@@ -715,7 +732,6 @@ def kb_insert_article(conn, req: AdminArticleRequest) -> Dict[str, Any]:
             insert_vals.append("%s")
             params.append(json.dumps(val) if val is not None else None)
 
-    # Required-ish text fields
     add("id", payload["id"])
     add("title", payload["title"])
     add("category", payload["category"])
@@ -724,19 +740,14 @@ def kb_insert_article(conn, req: AdminArticleRequest) -> Dict[str, Any]:
     add("years_max", payload["years_max"])
     add("customer_summary", payload["customer_summary"])
 
-    # Derived/optional schema fields
     add_json("clarifying_questions", payload.get("clarifying_questions"))
     add_json("steps", payload.get("steps"))
     add_json("model_year_notes", payload.get("model_year_notes") if payload.get("model_year_notes") is not None else {})
     add_json("stop_and_escalate", payload.get("stop_and_escalate") if payload.get("stop_and_escalate") is not None else {})
-
     add("next_step", payload.get("next_step"))
     add("retrieval_text", payload.get("retrieval_text"))
-
-    # Decision tree is jsonb
     add_json("decision_tree", payload.get("decision_tree"))
 
-    # embedding (pgvector)
     if "embedding" in cols:
         insert_cols.append("embedding")
         insert_vals.append("%s::vector")
@@ -751,7 +762,7 @@ def kb_insert_article(conn, req: AdminArticleRequest) -> Dict[str, Any]:
 
 
 # =========================
-# Supabase live chat logic
+# Supabase live chat logic (unchanged)
 # =========================
 def get_or_create_conversation_for_session(session_id: str) -> str:
     rows = sb_get(
@@ -761,24 +772,14 @@ def get_or_create_conversation_for_session(session_id: str) -> str:
     if rows and isinstance(rows, list) and rows[0].get("id"):
         return rows[0]["id"]
 
-    created = sb_post(
-        "conversations",
-        [{"customer_id": session_id}],
-    )
+    created = sb_post("conversations", [{"customer_id": session_id}])
     if not created or not isinstance(created, list) or not created[0].get("id"):
         raise HTTPException(status_code=502, detail="Failed to create supabase conversation.")
     return created[0]["id"]
 
 
 def supabase_insert_message(conversation_id: str, sender_id: str, sender_role: str, body: str) -> dict:
-    payload = [
-        {
-            "conversation_id": conversation_id,
-            "sender_id": sender_id,
-            "sender_role": sender_role,
-            "body": body,
-        }
-    ]
+    payload = [{"conversation_id": conversation_id, "sender_id": sender_id, "sender_role": sender_role, "body": body}]
     created = sb_post("messages", payload)
     if not created or not isinstance(created, list):
         raise HTTPException(status_code=502, detail="Failed to insert supabase message.")
@@ -851,20 +852,27 @@ def update_context(session_id: str, req: UpdateContextRequest):
 
 # -------------------------
 # Admin: AI troubleshooting progress for a session
+<<<<<<< HEAD
 # - This returns the AI+user messages from chat_messages (your progress log)
 # - Also includes pinned article/tree/node state if enabled
+=======
+>>>>>>> 53b9939 (changes)
 # -------------------------
 def _admin_ai_history_payload(conn, session_id: str) -> Dict[str, Any]:
     sess = get_session(conn, session_id)
     msgs = get_recent_messages(conn, session_id, limit=500)
 
+<<<<<<< HEAD
     # Convert to the shape your admin-chat.tsx expects: [{role, text, created_at}]
+=======
+>>>>>>> 53b9939 (changes)
     out_msgs = []
     for m in (msgs or []):
         role = (m.get("role") or "").strip()
         text = (m.get("text") or "").strip()
         if not role or not text:
             continue
+<<<<<<< HEAD
         out_msgs.append(
             {
                 "role": role,
@@ -872,6 +880,9 @@ def _admin_ai_history_payload(conn, session_id: str) -> Dict[str, Any]:
                 "created_at": m.get("created_at"),
             }
         )
+=======
+        out_msgs.append({"role": role, "text": text, "created_at": m.get("created_at")})
+>>>>>>> 53b9939 (changes)
 
     payload: Dict[str, Any] = {"session_id": session_id, "messages": out_msgs}
 
@@ -888,11 +899,20 @@ def _admin_ai_history_payload(conn, session_id: str) -> Dict[str, Any]:
         if isinstance(tree, dict) and sess.get("active_node_id"):
             payload["active_node_text"] = node_text(tree, sess.get("active_node_id"))
 
+<<<<<<< HEAD
     return payload
 
 
 # Your AdminChat currently calls: `${API_BASE_URL}/admin/ai-history/${customerId}`
 # This adds that route (no /v1) AND keeps the /v1 route for consistency.
+=======
+    if sessions_supports_active_question(conn):
+        payload["active_question_text"] = sess.get("active_question_text")
+
+    return payload
+
+
+>>>>>>> 53b9939 (changes)
 @app.get("/admin/ai-history/{session_id}")
 @app.get("/v1/admin/ai-history/{session_id}")
 def admin_ai_history(session_id: str, x_admin_key: str = Header(default="", alias="X-Admin-Key")):
@@ -902,7 +922,11 @@ def admin_ai_history(session_id: str, x_admin_key: str = Header(default="", alia
 
 
 # -------------------------
+<<<<<<< HEAD
 # Chat (Pinned-flow enabled)
+=======
+# Chat (Pinned-flow + active_question_text)
+>>>>>>> 53b9939 (changes)
 # -------------------------
 @app.post("/v1/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
@@ -936,12 +960,18 @@ def chat(req: ChatRequest):
                 message_id=str(uuid.uuid4()),
             )
 
+<<<<<<< HEAD
         # --- pinned flow state (if schema supports it) ---
         pin_supported = sessions_supports_pinning(conn)
+=======
+        pin_supported = sessions_supports_pinning(conn)
+        aq_supported = sessions_supports_active_question(conn)
+>>>>>>> 53b9939 (changes)
 
         active_article_id = sess.get("active_article_id") if pin_supported else None
         active_node_id = sess.get("active_node_id") if pin_supported else None
         active_tree = sess.get("active_tree") if pin_supported else None
+<<<<<<< HEAD
 
         # reset flow if user explicitly asks to switch/reset
         if pin_supported and should_reset_flow(req.message):
@@ -956,16 +986,43 @@ def chat(req: ChatRequest):
             active_tree = None
 
         # decode active_tree if stored as string
+=======
+        active_question_text = sess.get("active_question_text") if aq_supported else None
+
+        # reset flow if user explicitly asks to switch/reset
+        if should_reset_flow(req.message):
+            updates = []
+            if pin_supported:
+                updates.append("active_article_id=NULL, active_node_id=NULL, active_tree=NULL")
+            if aq_supported:
+                updates.append("active_question_text=NULL")
+            if updates:
+                exec_no_return(conn, f"UPDATE sessions SET {', '.join(updates)} WHERE id=%s", (req.session_id,))
+                conn.commit()
+            active_article_id = None
+            active_node_id = None
+            active_tree = None
+            active_question_text = None
+
+>>>>>>> 53b9939 (changes)
         if isinstance(active_tree, str):
             try:
                 active_tree = json.loads(active_tree)
             except Exception:
                 active_tree = None
 
+<<<<<<< HEAD
         # Detect if this user message is a short yes/no
         yn = normalize_yes_no(req.message)
 
         # If we have an active pinned tree and the user replied yes/no, advance node and SKIP retrieval
+=======
+        yn = normalize_yes_no(req.message)
+
+        # If user says yes/no and we have a stored question, rewrite it so the model knows what it's answering.
+        rewritten_user_message = rewrite_short_answer(req.message, active_question_text)
+
+>>>>>>> 53b9939 (changes)
         use_pinned = bool(pin_supported and active_article_id and isinstance(active_tree, dict) and active_node_id and yn)
 
         used_articles: List[Dict[str, str]] = []
@@ -973,6 +1030,7 @@ def chat(req: ChatRequest):
         from_kb = False
 
         if use_pinned:
+<<<<<<< HEAD
             # advance decision tree
             next_node = advance_node(active_tree, active_node_id, req.message)
 
@@ -984,6 +1042,14 @@ def chat(req: ChatRequest):
             )
 
             # Build context from the pinned article only
+=======
+            next_node = advance_node(active_tree, active_node_id, req.message)
+
+            # update session node
+            exec_no_return(conn, "UPDATE sessions SET active_node_id=%s WHERE id=%s", (next_node, req.session_id))
+
+            # pinned article only
+>>>>>>> 53b9939 (changes)
             row = exec_one(
                 conn,
                 """
@@ -1005,12 +1071,16 @@ def chat(req: ChatRequest):
                     chunk += f"RETRIEVAL_TEXT:\n{rt}\n"
                 chunk += f"BODY:\n{body}\n\n"
 
+<<<<<<< HEAD
                 # Provide explicit active-node context to prevent the model from “freewheeling”
+=======
+>>>>>>> 53b9939 (changes)
                 if isinstance(tree, dict) and next_node:
                     qtext = node_text(tree, next_node)
                     if qtext:
                         chunk += f"ACTIVE_TROUBLESHOOTING_NODE:\n{next_node}\nQUESTION:\n{qtext}\n"
 
+<<<<<<< HEAD
                 context_chunks.append(chunk)
                 from_kb = True
 
@@ -1022,11 +1092,25 @@ def chat(req: ChatRequest):
             ranked = keyword_kb_articles(conn, req.message, year, category, top_k=6)
 
             # If no keyword hits, try vector search (requires embeddings)
+=======
+                # Also explicitly include the last asked question (if any)
+                if (active_question_text or "").strip():
+                    chunk += f'\nLAST_AI_QUESTION:\n{active_question_text.strip()}\n'
+
+                context_chunks.append(chunk)
+                from_kb = True
+
+        else:
+            ranked = keyword_kb_articles(conn, req.message, year, category, top_k=6)
+>>>>>>> 53b9939 (changes)
             if not ranked:
                 q_emb = embed(req.message)
                 ranked = rank_kb_articles(conn, q_emb, year, category, top_k=6)
 
+<<<<<<< HEAD
             # Build KB context (only from rows that pass the threshold)
+=======
+>>>>>>> 53b9939 (changes)
             for r, score in ranked:
                 if score < 0.15:
                     continue
@@ -1044,7 +1128,11 @@ def chat(req: ChatRequest):
 
             from_kb = len(context_chunks) > 0
 
+<<<<<<< HEAD
             # If we found a KB article and pinning is supported, pin the top article/tree
+=======
+            # Pin the top article/tree when available
+>>>>>>> 53b9939 (changes)
             if pin_supported and from_kb and ranked:
                 top = ranked[0][0]
                 tree = top.get("decision_tree")
@@ -1058,6 +1146,7 @@ def chat(req: ChatRequest):
                                active_node_id=%s
                          WHERE id=%s
                         """,
+<<<<<<< HEAD
                         (
                             top["id"],
                             json.dumps(tree),
@@ -1066,12 +1155,16 @@ def chat(req: ChatRequest):
                         ),
                     )
                     # no commit yet; we'll commit at end
+=======
+                        (top["id"], json.dumps(tree), tree.get("start"), req.session_id),
+                    )
+>>>>>>> 53b9939 (changes)
 
         history = get_recent_messages(conn, req.session_id, limit=50)
 
         try:
             answer, clarifying, confidence = generate_answer(
-                user_message=req.message,
+                user_message=rewritten_user_message,
                 context="\n\n---\n\n".join(context_chunks),
                 safety_flags=flags,
                 airstream_year=year,
@@ -1084,12 +1177,19 @@ def chat(req: ChatRequest):
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"LLM error: {e}")
 
+        # If the AI asked a clarifying question, store it as active_question_text
+        if aq_supported:
+            q_to_store = (clarifying[0] if (isinstance(clarifying, list) and len(clarifying) > 0) else "").strip()
+            exec_no_return(
+                conn,
+                "UPDATE sessions SET active_question_text=%s WHERE id=%s",
+                (q_to_store or None, req.session_id),
+            )
+
         message_id = str(uuid.uuid4())
         log_message(conn, req.session_id, "user", req.message)
         log_message(conn, req.session_id, "assistant", answer)
         conn.commit()
-
-        show_escalation = True
 
         return ChatResponse(
             answer=answer,
@@ -1097,7 +1197,7 @@ def chat(req: ChatRequest):
             safety_flags=flags,
             confidence=confidence,
             used_articles=[UsedArticle(**a) for a in used_articles],
-            show_escalation=show_escalation,
+            show_escalation=True,
             message_id=message_id,
         )
 
@@ -1150,15 +1250,9 @@ def livechat_history(session_id: str):
     return {"conversation_id": conv_id, "messages": rows or []}
 
 
-# =========================
-# Admin KB article create
-# =========================
 @app.post("/v1/admin/articles")
-def admin_create_article(
-    req: AdminArticleRequest, x_admin_key: str = Header(default="", alias="X-Admin-Key")
-):
+def admin_create_article(req: AdminArticleRequest, x_admin_key: str = Header(default="", alias="X-Admin-Key")):
     require_admin(x_admin_key)
-
     with db() as conn:
         try:
             out = kb_insert_article(conn, req)
@@ -1170,20 +1264,13 @@ def admin_create_article(
             raise HTTPException(status_code=500, detail=f"Failed to create article: {e}")
 
 
-# =========================
-# Admin live chat (INBOX + REPLY)
-# =========================
 @app.get("/v1/admin/livechat/conversations")
 def admin_livechat_conversations(x_admin_key: str = Header(default="", alias="X-Admin-Key")):
     require_admin(x_admin_key)
 
     msg_rows = sb_get(
         "messages",
-        {
-            "select": "id,conversation_id,sender_role,body,created_at",
-            "order": "created_at.desc",
-            "limit": "300",
-        },
+        {"select": "id,conversation_id,sender_role,body,created_at", "order": "created_at.desc", "limit": "300"},
     )
 
     conv_ids: List[str] = []
@@ -1193,11 +1280,7 @@ def admin_livechat_conversations(x_admin_key: str = Header(default="", alias="X-
         cid = r.get("conversation_id")
         if not cid or cid in last_by_conv:
             continue
-        last_by_conv[cid] = {
-            "sender_role": r.get("sender_role"),
-            "body": r.get("body"),
-            "created_at": r.get("created_at"),
-        }
+        last_by_conv[cid] = {"sender_role": r.get("sender_role"), "body": r.get("body"), "created_at": r.get("created_at")}
         conv_ids.append(cid)
         if len(conv_ids) >= 50:
             break
@@ -1205,35 +1288,20 @@ def admin_livechat_conversations(x_admin_key: str = Header(default="", alias="X-
     if not conv_ids:
         return {"conversations": []}
 
-    conv_rows = sb_get(
-        "conversations",
-        {
-            "select": "id,customer_id,created_at",
-            "id": f"in.({','.join(conv_ids)})",
-        },
-    )
+    conv_rows = sb_get("conversations", {"select": "id,customer_id,created_at", "id": f"in.({','.join(conv_ids)})"})
     by_id = {c.get("id"): c for c in (conv_rows or [])}
 
     conversations: List[Dict[str, Any]] = []
     for cid in conv_ids:
         c = by_id.get(cid) or {}
-        conversations.append(
-            {
-                "conversation_id": cid,
-                "customer_id": c.get("customer_id") or "",
-                "last_message": last_by_conv.get(cid),
-            }
-        )
+        conversations.append({"conversation_id": cid, "customer_id": c.get("customer_id") or "", "last_message": last_by_conv.get(cid)})
 
     return {"conversations": conversations}
 
 
 @app.get("/v1/admin/livechat/history/{conversation_id}")
-def admin_livechat_history(
-    conversation_id: str, x_admin_key: str = Header(default="", alias="X-Admin-Key")
-):
+def admin_livechat_history(conversation_id: str, x_admin_key: str = Header(default="", alias="X-Admin-Key")):
     require_admin(x_admin_key)
-
     rows = sb_get(
         "messages",
         {
@@ -1247,17 +1315,8 @@ def admin_livechat_history(
 
 
 @app.post("/v1/admin/livechat/send")
-def admin_livechat_send(
-    req: AdminLiveChatSendRequest, x_admin_key: str = Header(default="", alias="X-Admin-Key")
-):
+def admin_livechat_send(req: AdminLiveChatSendRequest, x_admin_key: str = Header(default="", alias="X-Admin-Key")):
     require_admin(x_admin_key)
-
     sender_id = OWNER_SUPABASE_USER_ID or "owner"
     msg = supabase_insert_message(req.conversation_id, sender_id, "owner", req.body)
     return {"ok": True, "conversation_id": req.conversation_id, "message": msg}
-
-
-# @app.exception_handler(Exception)
-# async def function_exception_handler(request: Request, exc: Exception):
-#     traceback.print_exc()
-#     return JSONResponse(status_code=500, content={"detail": str(exc)})
