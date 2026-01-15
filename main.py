@@ -414,14 +414,11 @@ def sessions_supports_pinning(conn) -> bool:
     return {"active_article_id", "active_node_id", "active_tree"}.issubset(cols)
 
 
-<<<<<<< HEAD
-=======
 def sessions_supports_active_question(conn) -> bool:
     cols = _get_sessions_columns(conn)
     return "active_question_text" in cols
 
 
->>>>>>> 53b9939 (changes)
 def get_session(conn, session_id: str) -> Dict[str, Any]:
     row = exec_one(conn, "SELECT * FROM sessions WHERE id=%s", (session_id,))
     if not row:
@@ -438,10 +435,6 @@ def log_message(conn, session_id: str, role: str, text: str):
 
 
 def get_recent_messages(conn, session_id: str, limit: int = 200):
-<<<<<<< HEAD
-    # use ASC so admin can see full progress in order
-=======
->>>>>>> 53b9939 (changes)
     return exec_all(
         conn,
         "SELECT role, content AS text, created_at FROM chat_messages WHERE session_id=%s ORDER BY created_at ASC LIMIT %s",
@@ -450,11 +443,7 @@ def get_recent_messages(conn, session_id: str, limit: int = 200):
 
 
 # =========================
-<<<<<<< HEAD
-# Pinned-flow helpers (prevents topic jumps)
-=======
 # Pinned-flow helpers
->>>>>>> 53b9939 (changes)
 # =========================
 YES_NO_MAP = {
     "y": "yes",
@@ -480,10 +469,6 @@ def normalize_yes_no(text: str) -> Optional[str]:
 
 
 def _opt_answer_key(opt: Dict[str, Any]) -> str:
-<<<<<<< HEAD
-    # Support multiple schemas: answer/value/label/text
-=======
->>>>>>> 53b9939 (changes)
     for k in ("answer", "value", "label", "text"):
         v = opt.get(k)
         if isinstance(v, str) and v.strip():
@@ -492,13 +477,6 @@ def _opt_answer_key(opt: Dict[str, Any]) -> str:
 
 
 def advance_node(tree: Dict[str, Any], node_id: str, user_answer: str) -> str:
-<<<<<<< HEAD
-    """
-    Moves within the decision_tree based on a yes/no answer.
-    Returns next node id (or same if it can't advance).
-    """
-=======
->>>>>>> 53b9939 (changes)
     try:
         nodes = tree.get("nodes") or {}
         if not isinstance(nodes, dict):
@@ -519,19 +497,9 @@ def advance_node(tree: Dict[str, Any], node_id: str, user_answer: str) -> str:
             goto = (opt.get("goto") or "").strip()
             if not goto:
                 continue
-<<<<<<< HEAD
-            if key in {ua, "yes/no", "true/false"}:
-                # If "yes/no", we can't decide; only accept direct matches
-                if key in {"yes/no", "true/false"}:
-                    continue
-                return goto
-
-        # also allow "true"/"false" schemas
-=======
             if key == ua:
                 return goto
 
->>>>>>> 53b9939 (changes)
         for opt in opts:
             if not isinstance(opt, dict):
                 continue
@@ -560,10 +528,6 @@ def should_reset_flow(message: str) -> bool:
     return any(p in t for p in ["new issue", "different issue", "different problem", "switch topic", "switch topics", "reset"])
 
 
-<<<<<<< HEAD
-# =========================
-# RAG helpers (existing)
-=======
 def rewrite_short_answer(user_text: str, active_question_text: Optional[str]) -> str:
     """
     Makes the meaning explicit for the model.
@@ -578,18 +542,12 @@ def rewrite_short_answer(user_text: str, active_question_text: Optional[str]) ->
 
 # =========================
 # RAG helpers
->>>>>>> 53b9939 (changes)
 # =========================
 def embed(text: str) -> List[float]:
     return embed_text(text)
 
 
 def rank_kb_articles(conn, query_embedding: List[float], year: Optional[int], category: Optional[str], top_k: int = 6):
-<<<<<<< HEAD
-    # Vector search (requires embeddings to be present)
-    # NOTE: include decision_tree so we can pin it.
-=======
->>>>>>> 53b9939 (changes)
     sql = """
     SELECT id, title,
            customer_summary AS body,
@@ -852,37 +810,18 @@ def update_context(session_id: str, req: UpdateContextRequest):
 
 # -------------------------
 # Admin: AI troubleshooting progress for a session
-<<<<<<< HEAD
-# - This returns the AI+user messages from chat_messages (your progress log)
-# - Also includes pinned article/tree/node state if enabled
-=======
->>>>>>> 53b9939 (changes)
 # -------------------------
 def _admin_ai_history_payload(conn, session_id: str) -> Dict[str, Any]:
     sess = get_session(conn, session_id)
     msgs = get_recent_messages(conn, session_id, limit=500)
 
-<<<<<<< HEAD
-    # Convert to the shape your admin-chat.tsx expects: [{role, text, created_at}]
-=======
->>>>>>> 53b9939 (changes)
     out_msgs = []
     for m in (msgs or []):
         role = (m.get("role") or "").strip()
         text = (m.get("text") or "").strip()
         if not role or not text:
             continue
-<<<<<<< HEAD
-        out_msgs.append(
-            {
-                "role": role,
-                "text": text,
-                "created_at": m.get("created_at"),
-            }
-        )
-=======
         out_msgs.append({"role": role, "text": text, "created_at": m.get("created_at")})
->>>>>>> 53b9939 (changes)
 
     payload: Dict[str, Any] = {"session_id": session_id, "messages": out_msgs}
 
@@ -899,20 +838,12 @@ def _admin_ai_history_payload(conn, session_id: str) -> Dict[str, Any]:
         if isinstance(tree, dict) and sess.get("active_node_id"):
             payload["active_node_text"] = node_text(tree, sess.get("active_node_id"))
 
-<<<<<<< HEAD
-    return payload
-
-
-# Your AdminChat currently calls: `${API_BASE_URL}/admin/ai-history/${customerId}`
-# This adds that route (no /v1) AND keeps the /v1 route for consistency.
-=======
     if sessions_supports_active_question(conn):
         payload["active_question_text"] = sess.get("active_question_text")
 
     return payload
 
 
->>>>>>> 53b9939 (changes)
 @app.get("/admin/ai-history/{session_id}")
 @app.get("/v1/admin/ai-history/{session_id}")
 def admin_ai_history(session_id: str, x_admin_key: str = Header(default="", alias="X-Admin-Key")):
@@ -922,11 +853,7 @@ def admin_ai_history(session_id: str, x_admin_key: str = Header(default="", alia
 
 
 # -------------------------
-<<<<<<< HEAD
-# Chat (Pinned-flow enabled)
-=======
 # Chat (Pinned-flow + active_question_text)
->>>>>>> 53b9939 (changes)
 # -------------------------
 @app.post("/v1/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
@@ -960,33 +887,12 @@ def chat(req: ChatRequest):
                 message_id=str(uuid.uuid4()),
             )
 
-<<<<<<< HEAD
-        # --- pinned flow state (if schema supports it) ---
-        pin_supported = sessions_supports_pinning(conn)
-=======
         pin_supported = sessions_supports_pinning(conn)
         aq_supported = sessions_supports_active_question(conn)
->>>>>>> 53b9939 (changes)
 
         active_article_id = sess.get("active_article_id") if pin_supported else None
         active_node_id = sess.get("active_node_id") if pin_supported else None
         active_tree = sess.get("active_tree") if pin_supported else None
-<<<<<<< HEAD
-
-        # reset flow if user explicitly asks to switch/reset
-        if pin_supported and should_reset_flow(req.message):
-            exec_no_return(
-                conn,
-                "UPDATE sessions SET active_article_id=NULL, active_node_id=NULL, active_tree=NULL WHERE id=%s",
-                (req.session_id,),
-            )
-            conn.commit()
-            active_article_id = None
-            active_node_id = None
-            active_tree = None
-
-        # decode active_tree if stored as string
-=======
         active_question_text = sess.get("active_question_text") if aq_supported else None
 
         # reset flow if user explicitly asks to switch/reset
@@ -1004,25 +910,17 @@ def chat(req: ChatRequest):
             active_tree = None
             active_question_text = None
 
->>>>>>> 53b9939 (changes)
         if isinstance(active_tree, str):
             try:
                 active_tree = json.loads(active_tree)
             except Exception:
                 active_tree = None
 
-<<<<<<< HEAD
-        # Detect if this user message is a short yes/no
-        yn = normalize_yes_no(req.message)
-
-        # If we have an active pinned tree and the user replied yes/no, advance node and SKIP retrieval
-=======
         yn = normalize_yes_no(req.message)
 
         # If user says yes/no and we have a stored question, rewrite it so the model knows what it's answering.
         rewritten_user_message = rewrite_short_answer(req.message, active_question_text)
 
->>>>>>> 53b9939 (changes)
         use_pinned = bool(pin_supported and active_article_id and isinstance(active_tree, dict) and active_node_id and yn)
 
         used_articles: List[Dict[str, str]] = []
@@ -1030,26 +928,12 @@ def chat(req: ChatRequest):
         from_kb = False
 
         if use_pinned:
-<<<<<<< HEAD
-            # advance decision tree
-            next_node = advance_node(active_tree, active_node_id, req.message)
-
-            # update session node
-            exec_no_return(
-                conn,
-                "UPDATE sessions SET active_node_id=%s WHERE id=%s",
-                (next_node, req.session_id),
-            )
-
-            # Build context from the pinned article only
-=======
             next_node = advance_node(active_tree, active_node_id, req.message)
 
             # update session node
             exec_no_return(conn, "UPDATE sessions SET active_node_id=%s WHERE id=%s", (next_node, req.session_id))
 
             # pinned article only
->>>>>>> 53b9939 (changes)
             row = exec_one(
                 conn,
                 """
@@ -1071,28 +955,11 @@ def chat(req: ChatRequest):
                     chunk += f"RETRIEVAL_TEXT:\n{rt}\n"
                 chunk += f"BODY:\n{body}\n\n"
 
-<<<<<<< HEAD
-                # Provide explicit active-node context to prevent the model from “freewheeling”
-=======
->>>>>>> 53b9939 (changes)
                 if isinstance(tree, dict) and next_node:
                     qtext = node_text(tree, next_node)
                     if qtext:
                         chunk += f"ACTIVE_TROUBLESHOOTING_NODE:\n{next_node}\nQUESTION:\n{qtext}\n"
 
-<<<<<<< HEAD
-                context_chunks.append(chunk)
-                from_kb = True
-
-            # refresh sess for accurate state later (optional)
-            sess = get_session(conn, req.session_id)
-
-        else:
-            # ✅ DB-first: try keyword/title match first (works even if embeddings are NULL)
-            ranked = keyword_kb_articles(conn, req.message, year, category, top_k=6)
-
-            # If no keyword hits, try vector search (requires embeddings)
-=======
                 # Also explicitly include the last asked question (if any)
                 if (active_question_text or "").strip():
                     chunk += f'\nLAST_AI_QUESTION:\n{active_question_text.strip()}\n'
@@ -1102,15 +969,10 @@ def chat(req: ChatRequest):
 
         else:
             ranked = keyword_kb_articles(conn, req.message, year, category, top_k=6)
->>>>>>> 53b9939 (changes)
             if not ranked:
                 q_emb = embed(req.message)
                 ranked = rank_kb_articles(conn, q_emb, year, category, top_k=6)
 
-<<<<<<< HEAD
-            # Build KB context (only from rows that pass the threshold)
-=======
->>>>>>> 53b9939 (changes)
             for r, score in ranked:
                 if score < 0.15:
                     continue
@@ -1128,11 +990,7 @@ def chat(req: ChatRequest):
 
             from_kb = len(context_chunks) > 0
 
-<<<<<<< HEAD
-            # If we found a KB article and pinning is supported, pin the top article/tree
-=======
             # Pin the top article/tree when available
->>>>>>> 53b9939 (changes)
             if pin_supported and from_kb and ranked:
                 top = ranked[0][0]
                 tree = top.get("decision_tree")
@@ -1146,19 +1004,8 @@ def chat(req: ChatRequest):
                                active_node_id=%s
                          WHERE id=%s
                         """,
-<<<<<<< HEAD
-                        (
-                            top["id"],
-                            json.dumps(tree),
-                            tree.get("start"),
-                            req.session_id,
-                        ),
-                    )
-                    # no commit yet; we'll commit at end
-=======
                         (top["id"], json.dumps(tree), tree.get("start"), req.session_id),
                     )
->>>>>>> 53b9939 (changes)
 
         history = get_recent_messages(conn, req.session_id, limit=50)
 
