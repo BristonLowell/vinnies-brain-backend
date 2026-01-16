@@ -2,6 +2,7 @@
 
 import os
 import json
+import re
 from typing import List, Tuple, Optional, Any, Dict
 
 from dotenv import load_dotenv
@@ -42,6 +43,78 @@ def _history_to_text(history: Any, max_items: int = 20) -> str:
     return "\n".join(lines).strip()
 
 
+def _normalize_question(q: str) -> str:
+    q = (q or "").strip().lower()
+    q = re.sub(r"\s+", " ", q)
+    q = q.strip(" .!?;:\n\r\t")
+    return q
+
+
+def _extract_questions_from_text(text: str) -> List[str]:
+    """
+    Best-effort extraction of questions from assistant text.
+    We treat lines ending with '?' as questions, plus any '?'-terminated fragments.
+    """
+    if not text:
+        return []
+    candidates: List[str] = []
+
+    for line in text.splitlines():
+        line = line.strip()
+        if line.endswith("?") and len(line) > 1:
+            candidates.append(line)
+
+    # Also grab fragments that end in '?'
+    parts = re.split(r"(\?)", text)
+    buf = ""
+    for p in parts:
+        buf += p
+        if p == "?":
+            frag = buf.strip()
+            buf = ""
+            if frag and len(frag) > 1:
+                candidates.append(frag)
+
+    out: List[str] = []
+    seen = set()
+    for c in candidates:
+        n = _normalize_question(c)
+        if n and n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
+
+
+def _count_question_repeats_in_history(history: Optional[List[Dict[str, Any]]], question_norm: str) -> int:
+    """
+    Counts how many prior ASSISTANT messages contained this normalized question.
+    """
+    if not history or not question_norm:
+        return 0
+    count = 0
+    for h in history:
+        if not isinstance(h, dict):
+            continue
+        if (h.get("role") or "").strip().lower() != "assistant":
+            continue
+        text = (h.get("text") or "").strip()
+        if not text:
+            continue
+        qs = _extract_questions_from_text(text)
+        if question_norm in qs:
+            count += 1
+    return count
+
+
+def _force_escalation_message() -> str:
+    return (
+        "I’m starting to repeat the same diagnostic question, which usually means we need a human to jump in.\n\n"
+        "Most likely: this needs a hands-on check to confirm the exact source/path (a photo or quick inspection usually settles it).\n"
+        "Also possible: the symptoms match more than one common failure point without a visual confirmation.\n\n"
+        "Please tap **Request Help** so we can escalate this and get you to support with your session details."
+    )
+
+
 def generate_answer(
     *,
     user_message: str,
@@ -58,8 +131,6 @@ def generate_answer(
     safety_flags = safety_flags or []
     transcript = _history_to_text(history)
 
-    # SYSTEM-LEVEL RULE: Airstream-only assistant + refusal behavior
-    # Keep it strict, but still return the same JSON schema your app expects.
     system_instructions = f"""
 You are Vinnie's Brain, an AI assistant that ONLY provides information related to Airstream travel trailers (especially 2010–2025) and their systems, maintenance, troubleshooting, repairs, parts, ownership, and model-specific guidance.
 
@@ -82,62 +153,44 @@ PRIMARY RULE (reduce repetitive questions):
 - Only ask a clarifying question if the user's answer would change the VERY NEXT STEP you would give.
 - If the next step would be the same either way, do NOT ask — proceed with the best safe next step.
 
+QUESTION STYLE:
+- Do NOT default to yes/no questions.
+- Prefer specific diagnostic questions that narrow the problem efficiently.
+- When helpful, ask as a multiple-choice question with 2–4 options (e.g., "Which best matches: A / B / C?").
+- Use yes/no only when the decision is truly binary and immediately branch-defining.
+
 QUESTION LIMIT:
 - Ask at most ONE clarifying question per message.
-- clarifying_questions MUST contain 0 or 1 items (never 2–3).
+- clarifying_questions MUST contain 0 or 1 items.
 
-ANTI-REPETITION CHECK (mandatory before asking):
-- Before asking any question, check the recent chat history + provided context.
-- If the user already answered it (even implicitly), DO NOT ask again. Move forward.
-- Do NOT ask "nice-to-know" questions that do not unlock a different next action.
+ANTI-REPETITION:
+- Before asking any question, check recent chat history + context.
+- If the user already answered it (even implicitly), do not ask again. Move forward.
 
 ASSUME AND ADVANCE:
 - If key details are missing, make a reasonable best-guess assumption and proceed with the safest next step.
-- If you make an assumption, label it briefly (e.g., "Assuming this is an active leak...")
-- Do not ask a question just because information is missing.
+- If you make an assumption, label it briefly.
+
+PROVIDE LIKELY CAUSES:
+- Include 1–2 likely causes in most responses, phrased as "Most likely: ..." and "Also possible: ...".
+- Keep it short.
 
 KNOWN CONTEXT:
 - Airstream year: {airstream_year if airstream_year is not None else "unknown"}
 - Category: {category or "unknown"}
 - Safety flags: {", ".join(safety_flags) if safety_flags else "none"}
 
-OUTPUT RULES (keep UX consistent):
-1) If NO clarifying question is needed:
-   - Start with concise, numbered next steps (1–5 actions).
-   - Keep it practical and specific.
+OUTPUT RULES:
+- If you ask ONE clarifying question, keep the answer concise, include 1–2 likely causes, and do not provide long fix instructions yet.
 
-2) If ONE clarifying question IS needed (because it unlocks a different next step or addresses safety risk):
-   - Do NOT provide multi-step solutions, likely causes lists, or detailed fix instructions yet.
-   - The "answer" must be short and ONLY:
-     (a) a one-sentence acknowledgement/summary,
-     (b) the reason you need the detail (one short sentence),
-     (c) optionally ONE immediate safety check ONLY if there is a real safety risk (electric, propane, active leak, smoke, overheating).
-   - Then ask the single clarifying question (in clarifying_questions).
-
-3) SHORTNESS LIMITS:
-   - Keep the "answer" under ~90 words when asking a clarifying question.
-   - Otherwise, keep the "answer" under ~160 words and max 6 bullets unless the user asks for more detail.
-
-DECISION TREE BEHAVIOR (when KB context includes decision-tree steps/articles):
-- Follow the decision-tree branch if applicable.
-- If the branch is unclear:
-  - Prefer providing the most broadly correct safe next step that applies across branches.
-  - Only ask ONE branch-deciding question if you truly cannot choose the next action safely.
-
-Return STRICT JSON with this schema:
+Return STRICT JSON:
 {{
   "answer": string,
   "clarifying_questions": string[],
   "confidence": number
 }}
-
-Rules:
-- confidence is 0.0 to 1.0 (higher when KB context is strong and question is specific).
-- clarifying_questions: MUST be either [] or [one short question].
-- If you include clarifying_questions, your "answer" MUST NOT include step-by-step fixes beyond a single safety check if needed.
 """.strip()
 
-    # Combine KB + history + message
     kb_block = (context or "").strip()
     hist_block = transcript
 
@@ -156,11 +209,8 @@ Rules:
         temperature=0.2,
     )
 
-    # Try to read output_text first
-    out_text = getattr(resp, "output_text", None) or ""
-    out_text = out_text.strip()
+    out_text = (getattr(resp, "output_text", None) or "").strip()
 
-    # Parse JSON; fall back gracefully if model returned plain text
     answer = ""
     clarifying: List[str] = []
     confidence = 0.55
@@ -178,10 +228,8 @@ Rules:
             except Exception:
                 confidence = 0.55
         except Exception:
-            # Not JSON; treat as answer text
             answer = out_text
 
-    # Extra fallback if output_text missing
     if not answer:
         chunks: List[str] = []
         for item in getattr(resp, "output", []) or []:
@@ -190,6 +238,40 @@ Rules:
                 if t:
                     chunks.append(t)
         answer = "\n".join(chunks).strip() or "Sorry — I couldn’t generate a response."
+
+    # --- AUTO ESCALATION-STYLE MESSAGE (repeat same question 2+ times) ---
+    # We check BOTH:
+    #   A) the explicit clarifying question (if provided)
+    #   B) any question(s) embedded in the answer text (in case the model put it there)
+    candidate_questions: List[str] = []
+
+    if clarifying:
+        candidate_questions.append(_normalize_question(clarifying[0]))
+
+    # Extract from answer too
+    candidate_questions.extend(_extract_questions_from_text(answer))
+
+    # De-dupe candidates while preserving order
+    seen = set()
+    deduped: List[str] = []
+    for q in candidate_questions:
+        qn = _normalize_question(q)
+        if qn and qn not in seen:
+            seen.add(qn)
+            deduped.append(qn)
+
+    should_force = False
+    for qn in deduped:
+        repeats = _count_question_repeats_in_history(history, qn)
+        if repeats >= 2:
+            should_force = True
+            break
+
+    if should_force:
+        # Force an escalation-style message (no clarifying questions)
+        clarifying = []
+        confidence = min(confidence, 0.25)
+        answer = _force_escalation_message()
 
     # Clamp confidence
     if confidence < 0.0:
