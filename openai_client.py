@@ -115,6 +115,37 @@ def _force_escalation_message() -> str:
     )
 
 
+def _strip_question_lines_from_answer(answer: str) -> str:
+    """
+    Remove question lines from the main answer so the question only appears at the bottom UI.
+    Also removes bolded question lines like **... ?**
+    """
+    if not answer:
+        return answer
+
+    cleaned_lines: List[str] = []
+    for line in answer.splitlines():
+        raw = line.strip()
+        if not raw:
+            cleaned_lines.append(line)
+            continue
+
+        # Strip markdown bold wrapper for evaluation
+        unbold = raw
+        if unbold.startswith("**") and unbold.endswith("**") and len(unbold) > 4:
+            unbold = unbold[2:-2].strip()
+
+        # If the line is a question, drop it
+        if unbold.endswith("?"):
+            continue
+
+        cleaned_lines.append(line)
+
+    # Also remove leading empty lines created by stripping
+    out = "\n".join(cleaned_lines).strip()
+    return out
+
+
 def generate_answer(
     *,
     user_message: str,
@@ -143,6 +174,11 @@ When refusing:
 - Invite the user to ask an Airstream-specific question
 - Do NOT provide general advice or an off-topic answer
 - Still return valid JSON in the required schema
+
+CRITICAL FORMAT RULE (UI requirement):
+- NEVER put the clarifying question in the "answer" text (especially not bold at the top).
+- If a question is required, put it ONLY in "clarifying_questions".
+- The "answer" must contain explanation / likely causes / next steps — but NO question.
 
 Core behavior:
 - Be technical-but-clear and calm.
@@ -182,6 +218,7 @@ KNOWN CONTEXT:
 
 OUTPUT RULES:
 - If you ask ONE clarifying question, keep the answer concise, include 1–2 likely causes, and do not provide long fix instructions yet.
+- The question itself must appear ONLY in clarifying_questions.
 
 Return STRICT JSON:
 {{
@@ -239,19 +276,29 @@ Return STRICT JSON:
                     chunks.append(t)
         answer = "\n".join(chunks).strip() or "Sorry — I couldn’t generate a response."
 
+    # --- UI FIX: remove any question lines from the top/body of the answer ---
+    # This ensures the question only appears in clarifying_questions (bottom of your UI).
+    answer = _strip_question_lines_from_answer(answer)
+
+    # --- UI FIX: bold the clarifying question (so the bottom question is bold) ---
+    if clarifying:
+        q = clarifying[0].strip()
+        # Avoid double-bolding
+        if not (q.startswith("**") and q.endswith("**")):
+            clarifying = [f"**{q}**"]
+
     # --- AUTO ESCALATION-STYLE MESSAGE (repeat same question 2+ times) ---
-    # We check BOTH:
-    #   A) the explicit clarifying question (if provided)
-    #   B) any question(s) embedded in the answer text (in case the model put it there)
     candidate_questions: List[str] = []
 
     if clarifying:
-        candidate_questions.append(_normalize_question(clarifying[0]))
+        # remove ** for repeat-detection normalization
+        q0 = clarifying[0].strip()
+        if q0.startswith("**") and q0.endswith("**") and len(q0) > 4:
+            q0 = q0[2:-2].strip()
+        candidate_questions.append(_normalize_question(q0))
 
-    # Extract from answer too
     candidate_questions.extend(_extract_questions_from_text(answer))
 
-    # De-dupe candidates while preserving order
     seen = set()
     deduped: List[str] = []
     for q in candidate_questions:
@@ -268,7 +315,6 @@ Return STRICT JSON:
             break
 
     if should_force:
-        # Force an escalation-style message (no clarifying questions)
         clarifying = []
         confidence = min(confidence, 0.25)
         answer = _force_escalation_message()
