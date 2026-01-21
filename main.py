@@ -443,6 +443,103 @@ def get_recent_messages(conn, session_id: str, limit: int = 200):
 
 
 # =========================
+# Subtle check-in helpers (NEW)
+# =========================
+_CHECKIN_MARKERS = [
+    "when you get a chance",
+    "let me know what happened",
+    "tell me what you see",
+    "what did you notice",
+    "did that change anything",
+    "did that help",
+    "after you try that",
+]
+
+
+def _looks_like_multi_step(answer_text: str) -> bool:
+    t = (answer_text or "")
+    if len(t) >= 900:
+        return True
+    stepish = 0
+    for line in t.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if s[:3].isdigit() and s[3:4] in {".", ")", ":"}:
+            stepish += 1
+        if s.lower().startswith(("step ", "steps:", "try this:", "do this:")):
+            stepish += 1
+    return stepish >= 2
+
+
+def _recent_assistant_texts(history: List[Dict[str, Any]], max_n: int = 10) -> List[str]:
+    out: List[str] = []
+    for m in reversed(history or []):
+        if len(out) >= max_n:
+            break
+        if (m.get("role") or "").strip() == "assistant":
+            out.append((m.get("text") or "").strip())
+    return out
+
+
+def _already_checked_in_recently(history: List[Dict[str, Any]]) -> bool:
+    for t in _recent_assistant_texts(history, max_n=8):
+        tl = t.lower()
+        if any(k in tl for k in _CHECKIN_MARKERS):
+            return True
+    return False
+
+
+def _assistant_question_count_recent(history: List[Dict[str, Any]], max_n: int = 8) -> int:
+    c = 0
+    for t in _recent_assistant_texts(history, max_n=max_n):
+        # Count question marks as a lightweight proxy for "we already asked something"
+        c += t.count("?")
+    return c
+
+
+def maybe_append_subtle_checkin(
+    answer: str,
+    clarifying: List[str],
+    confidence: float,
+    from_kb: bool,
+    history: List[Dict[str, Any]],
+) -> str:
+    """
+    Adds a subtle, occasional follow-up line.
+    Guardrails:
+      - only when we have decent confidence
+      - only when coming from KB (so it's "your" flow)
+      - not if we already asked a clarifying question
+      - not too frequent (avoid if check-in appeared recently)
+      - avoid piling questions (if we already asked multiple ? recently)
+      - mostly when the response looks like multi-step guidance
+    """
+    if not from_kb:
+        return answer
+
+    if (clarifying or []) and any((q or "").strip() for q in (clarifying or [])):
+        return answer
+
+    if confidence < 0.72:
+        return answer
+
+    if _already_checked_in_recently(history):
+        return answer
+
+    if _assistant_question_count_recent(history, max_n=6) >= 3:
+        return answer
+
+    if not _looks_like_multi_step(answer):
+        # Keep it rare for short/simple answers
+        return answer
+
+    # Add a gentle, non-pushy check-in line.
+    checkin_line = "When you get a chance to try that, tell me what happened (even if it didn’t change anything)."
+    return (answer.rstrip() + "\n\n" + checkin_line).strip()
+
+
+# =========================
 # Pinned-flow helpers
 # =========================
 YES_NO_MAP = {
@@ -1023,6 +1120,15 @@ def chat(req: ChatRequest):
                 confidence = min(confidence, 0.45)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"LLM error: {e}")
+
+        # Subtle check-in (NEW): occasionally append a gentle “let me know what happened after trying that”
+        answer = maybe_append_subtle_checkin(
+            answer=answer,
+            clarifying=clarifying,
+            confidence=confidence,
+            from_kb=from_kb,
+            history=history,
+        )
 
         # If the AI asked a clarifying question, store it as active_question_text
         if aq_supported:
