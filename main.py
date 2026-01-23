@@ -229,6 +229,11 @@ class AdminArticleRequest(BaseModel):
     decision_tree: Optional[Dict[str, Any]] = None  # jsonb
 
 
+# NEW (login-ready): claim guest sessions after login
+class ClaimSessionsRequest(BaseModel):
+    session_ids: List[str] = Field(default_factory=list)
+
+
 # =========================
 # Decision-tree helpers
 # =========================
@@ -419,6 +424,12 @@ def sessions_supports_active_question(conn) -> bool:
     return "active_question_text" in cols
 
 
+# NEW: login-ready sessions ownership
+def sessions_supports_user_id(conn) -> bool:
+    cols = _get_sessions_columns(conn)
+    return "user_id" in cols
+
+
 def get_session(conn, session_id: str) -> Dict[str, Any]:
     row = exec_one(conn, "SELECT * FROM sessions WHERE id=%s", (session_id,))
     if not row:
@@ -493,7 +504,6 @@ def _already_checked_in_recently(history: List[Dict[str, Any]]) -> bool:
 def _assistant_question_count_recent(history: List[Dict[str, Any]], max_n: int = 8) -> int:
     c = 0
     for t in _recent_assistant_texts(history, max_n=max_n):
-        # Count question marks as a lightweight proxy for "we already asked something"
         c += t.count("?")
     return c
 
@@ -505,16 +515,6 @@ def maybe_append_subtle_checkin(
     from_kb: bool,
     history: List[Dict[str, Any]],
 ) -> str:
-    """
-    Adds a subtle, occasional follow-up line.
-    Guardrails:
-      - only when we have decent confidence
-      - only when coming from KB (so it's "your" flow)
-      - not if we already asked a clarifying question
-      - not too frequent (avoid if check-in appeared recently)
-      - avoid piling questions (if we already asked multiple ? recently)
-      - mostly when the response looks like multi-step guidance
-    """
     if not from_kb:
         return answer
 
@@ -531,10 +531,8 @@ def maybe_append_subtle_checkin(
         return answer
 
     if not _looks_like_multi_step(answer):
-        # Keep it rare for short/simple answers
         return answer
 
-    # Add a gentle, non-pushy check-in line.
     checkin_line = "When you get a chance to try that, tell me what happened (even if it didn’t change anything)."
     return (answer.rstrip() + "\n\n" + checkin_line).strip()
 
@@ -626,10 +624,6 @@ def should_reset_flow(message: str) -> bool:
 
 
 def rewrite_short_answer(user_text: str, active_question_text: Optional[str]) -> str:
-    """
-    Makes the meaning explicit for the model.
-    Example: "yes" -> 'Answer to: "<question>" -> yes'
-    """
     yn = normalize_yes_no(user_text)
     q = (active_question_text or "").strip()
     if yn and q:
@@ -870,17 +864,113 @@ def health():
 
 
 @app.post("/v1/sessions", response_model=CreateSessionResponse)
-def create_session(req: CreateSessionRequest):
+def create_session(req: CreateSessionRequest, request: Request):
+    """
+    Creates a new session. If the client includes X-User-Id (UUID),
+    we attach the session to that user (login-ready).
+    """
     sid = str(uuid.uuid4())
+
+    # TEMP bridge until real auth exists:
+    # Later you will derive user_id from a verified JWT.
+    user_id = (request.headers.get("X-User-Id") or "").strip() or None
+
     with db() as conn:
         if req.reset_old_session_id:
             if req.delete_old_messages:
                 exec_no_return(conn, "DELETE FROM chat_messages WHERE session_id=%s", (req.reset_old_session_id,))
             exec_no_return(conn, "DELETE FROM sessions WHERE id=%s", (req.reset_old_session_id,))
 
-        exec_no_return(conn, "INSERT INTO sessions (id, channel, mode) VALUES (%s, %s, %s)", (sid, req.channel, req.mode))
+        if user_id and sessions_supports_user_id(conn):
+            exec_no_return(
+                conn,
+                "INSERT INTO sessions (id, channel, mode, user_id) VALUES (%s, %s, %s, %s)",
+                (sid, req.channel, req.mode, user_id),
+            )
+        else:
+            exec_no_return(conn, "INSERT INTO sessions (id, channel, mode) VALUES (%s, %s, %s)", (sid, req.channel, req.mode))
+
         conn.commit()
     return {"session_id": sid}
+
+
+@app.get("/v1/sessions")
+def list_sessions(request: Request):
+    """
+    Login-ready 'Previous Issues' endpoint.
+    Uses X-User-Id for now (temporary until JWT auth is implemented).
+    """
+    user_id = (request.headers.get("X-User-Id") or "").strip()
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Not authenticated (missing X-User-Id)")
+
+    with db() as conn:
+        if not sessions_supports_user_id(conn):
+            raise HTTPException(status_code=500, detail="sessions.user_id column missing (run migration)")
+
+        rows = exec_all(
+            conn,
+            """
+            SELECT
+              s.id AS session_id,
+              lm.created_at AS last_message_at,
+              lm.content AS preview
+            FROM sessions s
+            LEFT JOIN LATERAL (
+              SELECT created_at, content
+              FROM chat_messages
+              WHERE session_id = s.id
+              ORDER BY created_at DESC
+              LIMIT 1
+            ) lm ON TRUE
+            WHERE s.user_id = %s::uuid
+            ORDER BY lm.created_at DESC NULLS LAST
+            LIMIT 50
+            """,
+            (user_id,),
+        )
+
+    # trim preview
+    out = []
+    for r in rows or []:
+        p = (r.get("preview") or "").strip()
+        r["preview"] = (p[:120] + "…") if len(p) > 120 else p
+        out.append(r)
+
+    return {"sessions": out}
+
+
+@app.post("/v1/sessions/claim")
+def claim_sessions(req: ClaimSessionsRequest, request: Request):
+    """
+    Called once after login to attach guest sessions to the logged-in user.
+    Only claims sessions that are currently unowned (user_id IS NULL).
+    """
+    user_id = (request.headers.get("X-User-Id") or "").strip()
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Not authenticated (missing X-User-Id)")
+
+    session_ids = [s.strip() for s in (req.session_ids or []) if isinstance(s, str) and s.strip()]
+    if not session_ids:
+        return {"ok": True, "claimed": 0}
+
+    with db() as conn:
+        if not sessions_supports_user_id(conn):
+            raise HTTPException(status_code=500, detail="sessions.user_id column missing (run migration)")
+
+        exec_no_return(
+            conn,
+            """
+            UPDATE sessions
+               SET user_id = %s::uuid
+             WHERE id = ANY(%s::text[])
+               AND user_id IS NULL
+            """,
+            (user_id, session_ids),
+        )
+        conn.commit()
+
+    return {"ok": True, "claimed": len(session_ids)}
 
 
 @app.get("/v1/sessions/{session_id}")
