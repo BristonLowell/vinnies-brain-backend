@@ -139,6 +139,33 @@ def sb_upsert(table: str, payload: Any, on_conflict: str):
         with urllib.request.urlopen(req, timeout=15) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
+def sb_delete(table: str, params: Dict[str, str], prefer: str = "return=minimal") -> Any:
+    """Supabase REST DELETE helper. Filters are passed via query params."""
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+    qs = urlencode(params or {})
+    full = f"{url}?{qs}" if qs else url
+    headers = _sb_headers({"Prefer": prefer})
+
+    if requests is not None:
+        r = requests.delete(full, headers=headers, timeout=15)
+        if not r.ok:
+            raise HTTPException(status_code=502, detail=f"Supabase DELETE {table} failed: {r.status_code} {r.text}")
+        try:
+            return r.json()
+        except Exception:
+            return {"ok": True}
+    else:
+        req = urllib.request.Request(full, headers=headers, method="DELETE")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw = resp.read().decode("utf-8")
+            if not raw:
+                return {"ok": True}
+            try:
+                return json.loads(raw)
+            except Exception:
+                return {"ok": True}
+
+
 
 # =========================
 # Models
@@ -1363,3 +1390,82 @@ def admin_livechat_send(req: AdminLiveChatSendRequest, x_admin_key: str = Header
     sender_id = OWNER_SUPABASE_USER_ID or "owner"
     msg = supabase_insert_message(req.conversation_id, sender_id, "owner", req.body)
     return {"ok": True, "conversation_id": req.conversation_id, "message": msg}
+
+
+# -------------------------
+# Admin: Quality control (all AI sessions)
+# -------------------------
+@app.get("/v1/admin/sessions")
+def admin_list_all_sessions(x_admin_key: str = Header(default="", alias="X-Admin-Key")):
+    require_admin(x_admin_key)
+
+    with db() as conn:
+        cols = _get_sessions_columns(conn)
+
+        select_parts = ["s.id AS session_id"]
+        if "user_id" in cols:
+            select_parts.append("s.user_id AS user_id")
+        if "channel" in cols:
+            select_parts.append("s.channel AS channel")
+        if "mode" in cols:
+            select_parts.append("s.mode AS mode")
+        if "airstream_year" in cols:
+            select_parts.append("s.airstream_year AS airstream_year")
+        if "category" in cols:
+            select_parts.append("s.category AS category")
+        if "created_at" in cols:
+            select_parts.append("s.created_at AS created_at")
+
+        select_parts.append("lm.created_at AS last_message_at")
+        select_parts.append("lm.content AS preview")
+
+        sql = f"""
+        SELECT {', '.join(select_parts)}
+        FROM sessions s
+        LEFT JOIN LATERAL (
+          SELECT created_at, content
+          FROM chat_messages
+          WHERE session_id = s.id
+          ORDER BY created_at DESC
+          LIMIT 1
+        ) lm ON TRUE
+        ORDER BY lm.created_at DESC NULLS LAST
+        LIMIT 300
+        """
+
+        rows = exec_all(conn, sql, ())
+
+    out = []
+    for r in (rows or []):
+        ptxt = (r.get("preview") or "").strip()
+        r["preview"] = (ptxt[:140] + "…") if len(ptxt) > 140 else ptxt
+        out.append(r)
+
+    return {"sessions": out}
+
+
+@app.delete("/v1/admin/sessions/{session_id}")
+def admin_delete_session(session_id: str, x_admin_key: str = Header(default="", alias="X-Admin-Key")):
+    require_admin(x_admin_key)
+
+    with db() as conn:
+        _ = get_session(conn, session_id)  # ensure exists
+
+        exec_no_return(conn, "DELETE FROM chat_messages WHERE session_id=%s", (session_id,))
+        exec_no_return(conn, "DELETE FROM sessions WHERE id=%s", (session_id,))
+        conn.commit()
+
+    return {"ok": True}
+
+
+# -------------------------
+# Admin: delete a live chat conversation (Supabase)
+# -------------------------
+@app.delete("/v1/admin/livechat/conversations/{conversation_id}")
+def admin_delete_livechat_conversation(conversation_id: str, x_admin_key: str = Header(default="", alias="X-Admin-Key")):
+    require_admin(x_admin_key)
+
+    _ = sb_delete("messages", {"conversation_id": f"eq.{conversation_id}"}, prefer="return=minimal")
+    _ = sb_delete("conversations", {"id": f"eq.{conversation_id}"}, prefer="return=minimal")
+
+    return {"ok": True}
