@@ -2,13 +2,16 @@ import os
 import uuid
 import json
 import traceback
+import logging
+import time
 from contextlib import contextmanager
 from typing import List, Optional, Dict, Any, Tuple, Set
 from urllib.parse import urlencode
-from collections import deque
+from collections import deque, defaultdict
 
 import psycopg
 from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 
 from fastapi import FastAPI, HTTPException, Request, Header
 from fastapi.responses import JSONResponse
@@ -16,7 +19,6 @@ from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
 from openai_client import embed_text, generate_answer
-from web_search import web_search, WebSearchError
 
 # Prefer requests, but fall back to urllib if needed
 try:
@@ -40,14 +42,107 @@ ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", os.getenv("ADMIN_KEY", "")).strip()
 # =========================
 app = FastAPI()
 
+# =========================
+# Runtime hardening
+# =========================
+logger = logging.getLogger("vinniesbrain")
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+
+POOL_MIN_SIZE = int(os.getenv("DB_POOL_MIN", "1"))
+POOL_MAX_SIZE = int(os.getenv("DB_POOL_MAX", "6"))
+
+DB_POOL: ConnectionPool = ConnectionPool(
+    conninfo=DATABASE_URL,
+    min_size=POOL_MIN_SIZE,
+    max_size=POOL_MAX_SIZE,
+    timeout=15,
+)
+
+# naive in-memory rate limiting for /v1/chat (IP + session)
+_RATE_WINDOW_SEC = int(os.getenv("CHAT_RATE_WINDOW_SEC", "60"))
+_RATE_MAX_REQ = int(os.getenv("CHAT_RATE_MAX_REQ", "45"))
+_rate_buckets: Dict[str, deque] = defaultdict(deque)
+
+
+def _now() -> float:
+    return time.time()
+
+
+def _client_ip(request: Request) -> str:
+    xff = request.headers.get("x-forwarded-for", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    if request.client and request.client.host:
+        return request.client.host
+    return "unknown"
+
+
+def _rate_allow(bucket: str) -> bool:
+    ts = _now()
+    dq = _rate_buckets[bucket]
+    cutoff = ts - _RATE_WINDOW_SEC
+    while dq and dq[0] < cutoff:
+        dq.popleft()
+    if len(dq) >= _RATE_MAX_REQ:
+        return False
+    dq.append(ts)
+    return True
+
+
+@app.middleware("http")
+async def request_id_and_rate_limit(request: Request, call_next):
+    rid = request.headers.get("x-request-id") or str(uuid.uuid4())
+    request.state.request_id = rid
+
+    # Rate limit only the chat endpoint
+    if request.url.path == "/v1/chat":
+        try:
+            body = await request.body()
+            request._body = body  # restore for downstream reads
+        except Exception:
+            body = b""
+
+        sid = ""
+        try:
+            payload = json.loads(body.decode("utf-8")) if body else {}
+            sid = str(payload.get("session_id") or "")
+        except Exception:
+            sid = ""
+
+        bucket = f"{_client_ip(request)}:{sid or 'nosession'}"
+        if not _rate_allow(bucket):
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Too many messages. Please wait a moment and try again.", "request_id": rid},
+                headers={"X-Request-Id": rid},
+            )
+
+    start = _now()
+    try:
+        resp = await call_next(request)
+    except Exception:
+        logger.exception("Unhandled error rid=%s path=%s", rid, request.url.path)
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Server error", "request_id": rid},
+            headers={"X-Request-Id": rid},
+        )
+    finally:
+        dur_ms = int((_now() - start) * 1000)
+        logger.info("rid=%s %s %s %sms", rid, request.method, request.url.path, dur_ms)
+
+    resp.headers["X-Request-Id"] = rid
+    return resp
+
 
 @contextmanager
 def db():
-    conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
+    conn = DB_POOL.getconn()
     try:
+        conn.row_factory = dict_row
         yield conn
     finally:
-        conn.close()
+        DB_POOL.putconn(conn)
 
 
 def exec_one(conn, sql: str, params: Tuple = ()):
@@ -139,6 +234,7 @@ def sb_upsert(table: str, payload: Any, on_conflict: str):
         with urllib.request.urlopen(req, timeout=15) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
+
 def sb_delete(table: str, params: Dict[str, str], prefer: str = "return=minimal") -> Any:
     """Supabase REST DELETE helper. Filters are passed via query params."""
     url = f"{SUPABASE_URL}/rest/v1/{table}"
@@ -164,7 +260,6 @@ def sb_delete(table: str, params: Dict[str, str], prefer: str = "return=minimal"
                 return json.loads(raw)
             except Exception:
                 return {"ok": True}
-
 
 
 # =========================
@@ -883,6 +978,43 @@ def send_expo_push(expo_push_token: str, title: str, body: str, data: Optional[D
 
 
 # =========================
+# Escalations persistence
+# =========================
+def ensure_escalations_table(conn):
+    exec_no_return(
+        conn,
+        """
+        CREATE TABLE IF NOT EXISTS escalations (
+          id TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL,
+          name TEXT NOT NULL,
+          phone TEXT NOT NULL,
+          email TEXT NOT NULL,
+          message TEXT NOT NULL,
+          preferred_contact TEXT,
+          context_json JSONB,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+    )
+
+
+@app.on_event("startup")
+def _startup():
+    with db() as conn:
+        ensure_escalations_table(conn)
+        conn.commit()
+
+
+@app.on_event("shutdown")
+def _shutdown():
+    try:
+        DB_POOL.close()
+    except Exception:
+        pass
+
+
+# =========================
 # Routes
 # =========================
 @app.get("/health")
@@ -1232,9 +1364,6 @@ def chat(req: ChatRequest):
                 category=category,
                 history=history,
             )
-            if not from_kb:
-                answer = "⚠️ This information is NOT from Vinnies Brain’s database.\n\n" + answer
-                confidence = min(confidence, 0.45)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"LLM error: {e}")
 
@@ -1273,8 +1402,52 @@ def chat(req: ChatRequest):
 
 
 @app.post("/v1/escalations", response_model=EscalationResponse)
-def create_escalation(req: EscalationRequest):
+def create_escalation(req: EscalationRequest, request: Request):
     ticket_id = str(uuid.uuid4())
+
+    with db() as conn:
+        history = get_recent_messages(conn, req.session_id, limit=40)
+        sess = get_session(conn, req.session_id)
+
+        ctx = {
+            "airstream_year": sess.get("airstream_year"),
+            "category": sess.get("category"),
+            "history": history,
+        }
+
+        exec_no_return(
+            conn,
+            """
+            INSERT INTO escalations (id, session_id, name, phone, email, message, preferred_contact, context_json)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+            """,
+            (
+                ticket_id,
+                req.session_id,
+                req.name,
+                req.phone,
+                req.email,
+                req.message,
+                req.preferred_contact,
+                json.dumps(ctx),
+            ),
+        )
+
+        # Optional reset: start a fresh troubleshooting state after escalation
+        if req.reset_old:
+            try:
+                updates = []
+                if sessions_supports_pinning(conn):
+                    updates.append("active_article_id=NULL, active_node_id=NULL, active_tree=NULL")
+                if sessions_supports_active_question(conn):
+                    updates.append("active_question_text=NULL")
+                if updates:
+                    exec_no_return(conn, f"UPDATE sessions SET {', '.join(updates)} WHERE id=%s", (req.session_id,))
+            except Exception:
+                pass
+
+        conn.commit()
+
     return {"ticket_id": ticket_id}
 
 
