@@ -8,6 +8,9 @@ from contextlib import contextmanager
 from typing import List, Optional, Dict, Any, Tuple, Set
 from urllib.parse import urlencode
 from collections import deque, defaultdict
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
 
 import psycopg
 from psycopg.rows import dict_row
@@ -165,6 +168,84 @@ def exec_no_return(conn, sql: str, params: Tuple = ()):
 def clamp01(x: float) -> float:
     return max(0.0, min(1.0, float(x)))
 
+# =========================
+# Support routing helpers
+# =========================
+# Business hours are evaluated server-side in Pacific Time so iOS/Android behave identically.
+SUPPORT_TZ = os.getenv("SUPPORT_TZ", "America/Los_Angeles")
+SUPPORT_OPEN_HOUR = int(os.getenv("SUPPORT_OPEN_HOUR", "8"))   # 8am
+SUPPORT_CLOSE_HOUR = int(os.getenv("SUPPORT_CLOSE_HOUR", "17"))  # 5pm
+# 0=Mon ... 6=Sun
+SUPPORT_DAYS_OPEN = os.getenv("SUPPORT_DAYS_OPEN", "0,1,2,3,4")  # Mon–Fri
+SUPPORT_EMAIL_TO = os.getenv("SUPPORT_EMAIL_TO", "info@vinnies.net")
+
+
+def _pt_now() -> datetime:
+    return datetime.now(ZoneInfo(SUPPORT_TZ))
+
+
+def is_business_hours_now() -> bool:
+    now = _pt_now()
+    try:
+        open_days = {int(x.strip()) for x in SUPPORT_DAYS_OPEN.split(",") if x.strip() != ""}
+    except Exception:
+        open_days = {0, 1, 2, 3, 4}
+
+    if now.weekday() not in open_days:
+        return False
+
+    # open at SUPPORT_OPEN_HOUR:00 inclusive, close at SUPPORT_CLOSE_HOUR:00 exclusive
+    return SUPPORT_OPEN_HOUR <= now.hour < SUPPORT_CLOSE_HOUR
+
+
+def next_business_open_iso() -> str:
+    """Returns an ISO string (PT) for the next opening time."""
+    now = _pt_now()
+    try:
+        open_days = sorted({int(x.strip()) for x in SUPPORT_DAYS_OPEN.split(",") if x.strip() != ""})
+        if not open_days:
+            open_days = [0, 1, 2, 3, 4]
+    except Exception:
+        open_days = [0, 1, 2, 3, 4]
+
+    # search day by day up to 14 days
+    for i in range(0, 14):
+        d = now + timedelta(days=i)
+        if d.weekday() not in open_days:
+            continue
+        candidate = d.replace(hour=SUPPORT_OPEN_HOUR, minute=0, second=0, microsecond=0)
+        if candidate > now:
+            return candidate.isoformat()
+    # fallback: tomorrow at open
+    d = now + timedelta(days=1)
+    return d.replace(hour=SUPPORT_OPEN_HOUR, minute=0, second=0, microsecond=0).isoformat()
+
+
+def build_escalation_email_subject(session_id: str) -> str:
+    return f"Vinnies Brain Escalation — Session {session_id}"
+
+
+def build_escalation_email_body(*, req: 'EscalationRequest', transcript: str, business_hours: bool) -> str:
+    lines: List[str] = []
+    lines.append("Vinnies Brain — Escalation")
+    lines.append("")
+    lines.append(f"Session ID: {req.session_id}")
+    lines.append(f"Business hours at submit: {'YES' if business_hours else 'NO'}")
+    lines.append("")
+    lines.append("Customer info")
+    lines.append(f"Name: {req.name}")
+    if req.email:
+        lines.append(f"Email: {req.email}")
+    if req.phone:
+        lines.append(f"Phone: {req.phone}")
+    lines.append(f"Preferred contact: {req.preferred_contact}")
+    lines.append("")
+    lines.append("Issue summary")
+    lines.append(req.message or "")
+    lines.append("")
+    lines.append("AI troubleshooting transcript")
+    lines.append(transcript or "(no transcript found)")
+    return "\n".join(lines).strip()
 
 # =========================
 # Supabase REST helpers
@@ -314,6 +395,17 @@ class EscalationRequest(BaseModel):
 
 class EscalationResponse(BaseModel):
     ticket_id: str
+    escalation_id: Optional[str] = None
+    routing: str = "chat"  # chat | email | both
+    business_hours: bool = False
+    conversation_id: Optional[str] = None
+
+    # If the client wants the USER to send an email from their own mail app,
+    # we return a prefilled subject/body. The client can open a mailto: link.
+    email_to: Optional[str] = None
+    email_subject: Optional[str] = None
+    email_body: Optional[str] = None
+
 
 
 class LiveChatSendRequest(BaseModel):
@@ -573,6 +665,26 @@ def get_recent_messages(conn, session_id: str, limit: int = 200):
         "SELECT role, content AS text, created_at FROM chat_messages WHERE session_id=%s ORDER BY created_at ASC LIMIT %s",
         (session_id, limit),
     )
+
+def format_transcript(messages: List[Dict[str, Any]], max_chars: int = 9000) -> str:
+    """Human-readable transcript for escalation emails. Trims to keep mailto links usable."""
+    lines: List[str] = []
+    for m in messages or []:
+        role = (m.get("role") or "").strip().lower()
+        text = (m.get("text") or "").strip()
+        if not role or not text:
+            continue
+        tag = "YOU" if role == "user" else ("VINNIES" if role == "assistant" else role.upper())
+        lines.append(f"{tag}: {text}")
+
+    out = "\n\n".join(lines).strip()
+    if len(out) <= max_chars:
+        return out
+
+    # Keep the tail (most recent context tends to matter most)
+    tail = out[-max_chars:]
+    return "(transcript trimmed)\n...\n" + tail
+
 
 
 # =========================
@@ -1021,6 +1133,19 @@ def _shutdown():
 def health():
     return {"ok": True, "service": "vinnies-brain-backend"}
 
+@app.get("/v1/support/status")
+def support_status():
+    """Lets the mobile app decide whether to show Live Chat vs Email options."""
+    open_now = is_business_hours_now()
+    return {
+        "business_hours": open_now,
+        "timezone": SUPPORT_TZ,
+        "open_hour": SUPPORT_OPEN_HOUR,
+        "close_hour": SUPPORT_CLOSE_HOUR,
+        "next_open": None if open_now else next_business_open_iso(),
+        "support_email": SUPPORT_EMAIL_TO,
+    }
+
 
 @app.post("/v1/sessions", response_model=CreateSessionResponse)
 def create_session(req: CreateSessionRequest, request: Request):
@@ -1139,6 +1264,21 @@ def session_exists(session_id: str):
         if not row:
             raise HTTPException(status_code=404, detail="Session not found")
         return {"ok": True}
+
+@app.get("/v1/sessions/{session_id}/history")
+def session_history(session_id: str):
+    """Customer-safe transcript endpoint (used to prefill an escalation email)."""
+    with db() as conn:
+        _ = get_session(conn, session_id)
+        msgs = get_recent_messages(conn, session_id, limit=250)
+        out = []
+        for m in (msgs or []):
+            role = (m.get("role") or "").strip()
+            text = (m.get("text") or "").strip()
+            if not role or not text:
+                continue
+            out.append({"role": role, "text": text, "created_at": m.get("created_at")})
+        return {"session_id": session_id, "messages": out}
 
 
 @app.post("/v1/sessions/{session_id}/context")
@@ -1404,10 +1544,24 @@ def chat(req: ChatRequest):
 @app.post("/v1/escalations", response_model=EscalationResponse)
 def create_escalation(req: EscalationRequest, request: Request):
     ticket_id = str(uuid.uuid4())
+    open_now = is_business_hours_now()
+
+    pref = (req.preferred_contact or "").strip().lower()
+    wants_email = pref == "email" or bool((req.email or "").strip())
+
+    # Routing rules:
+    # - After hours: email only
+    # - During business hours: default to live chat, but email is available if user chose Email
+    routing = "email" if (not open_now) else ("email" if wants_email else "chat")
+
+    conversation_id: Optional[str] = None
+    transcript = ""
+    ctx: Dict[str, Any] = {}
 
     with db() as conn:
-        history = get_recent_messages(conn, req.session_id, limit=40)
         sess = get_session(conn, req.session_id)
+        history = get_recent_messages(conn, req.session_id, limit=250)
+        transcript = format_transcript(history, max_chars=9000)
 
         ctx = {
             "airstream_year": sess.get("airstream_year"),
@@ -1415,23 +1569,35 @@ def create_escalation(req: EscalationRequest, request: Request):
             "history": history,
         }
 
-        exec_no_return(
-            conn,
-            """
-            INSERT INTO escalations (id, session_id, name, phone, email, message, preferred_contact, context_json)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
-            """,
-            (
-                ticket_id,
-                req.session_id,
-                req.name,
-                req.phone,
-                req.email,
-                req.message,
-                req.preferred_contact,
-                json.dumps(ctx),
-            ),
-        )
+        # ✅ Keep existing Postgres insert (does not break current functionality)
+        try:
+            exec_no_return(
+                conn,
+                """
+                INSERT INTO escalations (id, session_id, name, phone, email, message, preferred_contact, context_json)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                """,
+                (
+                    ticket_id,
+                    req.session_id,
+                    req.name,
+                    req.phone,
+                    req.email,
+                    req.message,
+                    req.preferred_contact,
+                    json.dumps(ctx),
+                ),
+            )
+        except Exception:
+            # Some deployments may not have the Postgres escalations table; Supabase is the new source of truth.
+            pass
+
+        # If we're open and routing to chat, ensure a live chat conversation exists so the owner can jump in.
+        if routing == "chat":
+            try:
+                conversation_id = get_or_create_conversation_for_session(req.session_id)
+            except Exception:
+                conversation_id = None
 
         # Optional reset: start a fresh troubleshooting state after escalation
         if req.reset_old:
@@ -1448,7 +1614,56 @@ def create_escalation(req: EscalationRequest, request: Request):
 
         conn.commit()
 
-    return {"ticket_id": ticket_id}
+    # ✅ Supabase escalation row (admin dashboard source of truth)
+    escalation_row = {
+        "id": ticket_id,
+        "session_id": req.session_id,
+        "name": (req.name or "").strip(),
+        "phone": (req.phone or "").strip(),
+        "email": (req.email or "").strip(),
+        "message": (req.message or "").strip(),
+        "preferred_contact": (req.preferred_contact or "").strip(),
+        "status": "open",
+        "routing": routing,
+        "business_hours": open_now,
+        "conversation_id": conversation_id,
+        "context_json": ctx,
+        "transcript": transcript,
+    }
+
+    try:
+        _ = sb_post("escalations", [escalation_row])
+    except Exception:
+        # Don't block the customer UX if Supabase has a hiccup; the ticket_id still exists.
+        pass
+
+    # Notify owner via push for faster response (optional; safe if token missing)
+    try:
+        token = get_owner_push_token(OWNER_SUPABASE_USER_ID) if OWNER_SUPABASE_USER_ID else None
+        if token:
+            send_expo_push(
+                token,
+                title="New escalation",
+                body=(req.message or "").strip()[:120] or "New escalation received",
+                data={"session_id": req.session_id, "ticket_id": ticket_id, "conversation_id": conversation_id},
+            )
+    except Exception:
+        pass
+
+    email_subject = build_escalation_email_subject(req.session_id)
+    email_body = build_escalation_email_body(req=req, transcript=transcript, business_hours=open_now)
+
+    return {
+        "ticket_id": ticket_id,
+        "escalation_id": ticket_id,
+        "routing": routing,
+        "business_hours": open_now,
+        "conversation_id": conversation_id,
+        "email_to": SUPPORT_EMAIL_TO,
+        "email_subject": email_subject,
+        "email_body": email_body,
+    }
+
 
 
 @app.post("/v1/owner/push-token")
