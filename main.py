@@ -1722,6 +1722,53 @@ def admin_create_article(req: AdminArticleRequest, x_admin_key: str = Header(def
             raise HTTPException(status_code=500, detail=f"Failed to create article: {e}")
 
 
+@app.get("/v1/admin/escalations")
+def admin_list_escalations(
+    status: str = "",
+    x_admin_key: str = Header(default="", alias="X-Admin-Key"),
+):
+    require_admin(x_admin_key)
+
+    params: Dict[str, str] = {
+        "select": "id,session_id,name,phone,email,message,preferred_contact,status,routing,business_hours,conversation_id,created_at,handled_at",
+        "order": "created_at.desc",
+        "limit": "300",
+    }
+    if status.strip():
+        params["status"] = f"eq.{status.strip()}"
+
+    rows = sb_get("escalations", params)
+    out = []
+    for r in (rows or []):
+        msg = (r.get("message") or "").strip()
+        r["message_preview"] = (msg[:140] + "…") if len(msg) > 140 else msg
+        out.append(r)
+    return {"escalations": out}
+
+
+class AdminUpdateEscalationRequest(BaseModel):
+    status: Optional[str] = None  # open | in_progress | closed
+
+
+@app.post("/v1/admin/escalations/{escalation_id}")
+def admin_update_escalation(
+    escalation_id: str,
+    req: AdminUpdateEscalationRequest,
+    x_admin_key: str = Header(default="", alias="X-Admin-Key"),
+):
+    require_admin(x_admin_key)
+
+    payload: Dict[str, Any] = {"id": escalation_id}
+    if req.status and req.status.strip():
+        payload["status"] = req.status.strip()
+        if req.status.strip() in {"in_progress", "closed"}:
+            payload["handled_at"] = datetime.utcnow().isoformat()
+
+    _ = sb_upsert("escalations", [payload], on_conflict="id")
+    return {"ok": True}
+
+
+
 @app.get("/v1/admin/livechat/conversations")
 def admin_livechat_conversations(x_admin_key: str = Header(default="", alias="X-Admin-Key")):
     require_admin(x_admin_key)
@@ -1857,3 +1904,68 @@ def admin_delete_livechat_conversation(conversation_id: str, x_admin_key: str = 
     _ = sb_delete("conversations", {"id": f"eq.{conversation_id}"}, prefer="return=minimal")
 
     return {"ok": True}
+
+# -------------------------
+# Supabase REST helpers (ADD THIS)
+# -------------------------
+def sb_patch(table: str, payload: Any, filters: Dict[str, str], prefer: str = "return=representation") -> Any:
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+    qs = urlencode(filters or {})
+    full = f"{url}?{qs}" if qs else url
+    headers = _sb_headers({"Prefer": prefer})
+
+    if requests is not None:
+        r = requests.patch(full, headers=headers, json=payload, timeout=15)
+        if not r.ok:
+            raise HTTPException(status_code=502, detail=f"Supabase PATCH {table} failed: {r.status_code} {r.text}")
+        return r.json()
+    else:
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(full, headers=headers, data=data, method="PATCH")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+
+# -------------------------
+# Admin: Escalations (ADD THIS)
+# -------------------------
+@app.get("/v1/admin/escalations")
+def admin_list_escalations(
+    x_admin_key: str = Header(default="", alias="X-Admin-Key"),
+    limit: int = 200,
+):
+    require_admin(x_admin_key)
+
+    # Assumes you have a Supabase table named "escalations"
+    rows = sb_get(
+        "escalations",
+        {
+            "select": "*",
+            "order": "created_at.desc",
+            "limit": str(max(1, min(int(limit), 500))),
+        },
+    )
+    return {"escalations": rows or []}
+
+
+@app.patch("/v1/admin/escalations/{escalation_id}")
+def admin_update_escalation_status(
+    escalation_id: str,
+    req: dict,
+    x_admin_key: str = Header(default="", alias="X-Admin-Key"),
+):
+    require_admin(x_admin_key)
+
+    status = str(req.get("status", "")).strip()
+    if status not in {"open", "in_progress", "closed"}:
+        raise HTTPException(status_code=400, detail="Invalid status")
+
+    updated = sb_patch(
+        "escalations",
+        {"status": status},
+        {"id": f"eq.{escalation_id}"},
+    )
+    # Supabase returns an array when Prefer=return=representation
+    item = (updated[0] if isinstance(updated, list) and updated else None)
+    return {"ok": True, "escalation": item}
+
