@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
-from openai_client import embed_text, generate_answer
+from openai_client import embed_text, generate_answer, generate_checkpoint_summary
 
 # Prefer requests, but fall back to urllib if needed
 try:
@@ -146,6 +146,22 @@ def db():
         yield conn
     finally:
         DB_POOL.putconn(conn)
+
+# -------------------------
+# Telemetry (optional)
+# -------------------------
+def _telemetry_insert(conn, session_id: str, event_type: str, payload: Optional[Dict[str, Any]] = None) -> None:
+    """Best-effort telemetry. Will not raise if table doesn't exist."""
+    payload = payload or {}
+    try:
+        exec_no_return(
+            conn,
+            "INSERT INTO telemetry_events (session_id, event_type, payload) VALUES (%s, %s, %s)",
+            (session_id, event_type, json.dumps(payload)),
+        )
+    except Exception:
+        return
+
 
 
 def exec_one(conn, sql: str, params: Tuple = ()):
@@ -373,8 +389,16 @@ class UsedArticle(BaseModel):
     title: str
 
 
+class CheckpointSummary(BaseModel):
+    known: List[str] = []
+    ruled_out: List[str] = []
+    likely_causes: List[str] = []
+    next_checks: List[str] = []
+
+
 class ChatResponse(BaseModel):
     answer: str
+    checkpoint_summary: Optional[CheckpointSummary] = None
     clarifying_questions: List[str]
     safety_flags: List[str]
     confidence: float
@@ -385,13 +409,12 @@ class ChatResponse(BaseModel):
 
 class EscalationRequest(BaseModel):
     session_id: str
-    name: str
-    phone: str
-    email: str
+    name: Optional[str] = ""
+    phone: Optional[str] = ""
+    email: Optional[str] = ""
     message: str
     preferred_contact: Optional[str] = "text"
     reset_old: bool = False
-
 
 class EscalationResponse(BaseModel):
     ticket_id: str
@@ -1516,7 +1539,25 @@ def chat(req: ChatRequest):
             history=history,
         )
 
-        # If the AI asked a clarifying question, store it as active_question_text
+        # Checkpoint summary (every ~6 assistant messages): helps users + admins see progress.
+        checkpoint_summary = None
+        try:
+            assistant_count = sum(
+                1
+                for h in (history or [])
+                if (h.get("role") or "").strip().lower() == "assistant"
+            )
+            # Generate on the 6th, 12th, 18th... assistant response
+            if (assistant_count + 1) % 3 == 0:
+                checkpoint_summary = generate_checkpoint_summary(
+                    history=history,
+                    airstream_year=year,
+                    category=category,
+                )
+        except Exception:
+            checkpoint_summary = None
+
+# If the AI asked a clarifying question, store it as active_question_text
         if aq_supported:
             q_to_store = (clarifying[0] if (isinstance(clarifying, list) and len(clarifying) > 0) else "").strip()
             exec_no_return(
@@ -1527,11 +1568,16 @@ def chat(req: ChatRequest):
 
         message_id = str(uuid.uuid4())
         log_message(conn, req.session_id, "user", req.message)
+        _telemetry_insert(conn, req.session_id, "chat_user_message", {"len": len((req.message or ""))})
         log_message(conn, req.session_id, "assistant", answer)
+        _telemetry_insert(conn, req.session_id, "chat_assistant_message", {"len": len((answer or "")), "from_kb": from_kb})
+        if checkpoint_summary is not None:
+            _telemetry_insert(conn, req.session_id, "checkpoint_generated", {})
         conn.commit()
 
         return ChatResponse(
             answer=answer,
+            checkpoint_summary=CheckpointSummary(**checkpoint_summary) if isinstance(checkpoint_summary, dict) else None,
             clarifying_questions=clarifying,
             safety_flags=flags,
             confidence=confidence,

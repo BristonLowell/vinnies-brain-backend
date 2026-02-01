@@ -181,6 +181,8 @@ CRITICAL FORMAT RULE (UI requirement):
 - The "answer" must contain explanation / likely causes / next steps — but NO question.
 
 Core behavior:
+- Speak like Vinnie: an experienced Airstream tech (practical, confident, no fluff).
+- Never say “as an AI”, “I can’t browse”, or similar meta.
 - Be technical-but-clear and calm.
 - If a safety risk is present, lead with safety steps.
 - Prefer the knowledge base context when present.
@@ -326,3 +328,75 @@ Return STRICT JSON:
         confidence = 1.0
 
     return answer, clarifying, confidence
+
+
+def generate_checkpoint_summary(
+    *,
+    history: Optional[List[Dict[str, Any]]] = None,
+    airstream_year: Optional[int] = None,
+    category: Optional[str] = None,
+) -> Dict[str, List[str]]:
+    """Return a compact progress summary for UI/admin.
+
+    Output:
+      {
+        "known": [...],
+        "ruled_out": [...],
+        "likely_causes": [...],
+        "next_checks": [...]
+      }
+    """
+    transcript = _history_to_text(history, max_items=24)
+
+    instructions = f"""
+You are summarizing an Airstream troubleshooting chat into a short checkpoint.
+
+Rules:
+- Keep each bullet short (max ~12 words).
+- Do NOT invent facts. Only include what is stated or strongly implied.
+- Provide at most:
+  - known: up to 5 bullets
+  - ruled_out: up to 4 bullets
+  - likely_causes: 2–3 bullets
+  - next_checks: 2–4 bullets
+- If a section has nothing solid, return an empty list for it.
+
+Context:
+- Airstream year: {airstream_year if airstream_year is not None else "unknown"}
+- Category: {category or "unknown"}
+
+Return STRICT JSON:
+{{
+  "known": string[],
+  "ruled_out": string[],
+  "likely_causes": string[],
+  "next_checks": string[]
+}}
+""".strip()
+
+    input_text = ("CHAT HISTORY:\n" + transcript) if transcript else "CHAT HISTORY:\n(no history)"
+
+    resp = client.responses.create(
+        model=CHAT_MODEL,
+        instructions=instructions,
+        input=input_text,
+        temperature=0.2,
+    )
+
+    out_text = (getattr(resp, "output_text", None) or "").strip()
+    if not out_text:
+        return {"known": [], "ruled_out": [], "likely_causes": [], "next_checks": []}
+
+    try:
+        data = json.loads(out_text)
+        def _as_list(x):
+            return [str(i).strip() for i in (x or []) if str(i).strip()]
+
+        return {
+            "known": _as_list(data.get("known")),
+            "ruled_out": _as_list(data.get("ruled_out")),
+            "likely_causes": _as_list(data.get("likely_causes")),
+            "next_checks": _as_list(data.get("next_checks")),
+        }
+    except Exception:
+        return {"known": [], "ruled_out": [], "likely_causes": [], "next_checks": []}
