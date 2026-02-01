@@ -1543,7 +1543,8 @@ def chat(req: ChatRequest):
 
 @app.post("/v1/escalations", response_model=EscalationResponse)
 def create_escalation(req: EscalationRequest):
-    """Create an escalation ticket and persist it to Supabase (table: escalations).
+    """
+    Create an escalation ticket and persist it to Supabase (table: escalations).
 
     Important: we do NOT block the customer flow if Supabase insert fails.
     We return a ticket_id regardless so the frontend confirmation still works.
@@ -1568,18 +1569,41 @@ def create_escalation(req: EscalationRequest):
         except Exception:
             conversation_id = None
 
+    # ---- Map request -> DB schema (YOUR TABLE) ----
+    issue_summary = (req.message or "").strip()
+    # issue_summary is NOT NULL in your table, so ensure it has something
+    if not issue_summary:
+        issue_summary = "Escalation requested (no message provided)."
+
+    # Supabase table has single "contact" field (text). We'll combine email/phone if present.
+    contact_parts = []
+    if (req.email or "").strip():
+        contact_parts.append(f"email: {(req.email or '').strip()}")
+    if (req.phone or "").strip():
+        contact_parts.append(f"phone: {(req.phone or '').strip()}")
+    contact = " | ".join(contact_parts) if contact_parts else None
+
+    excerpt = issue_summary[:280]  # optional; your table has conversation_excerpt
+
     full_row = {
-        "id": ticket_id,
-        "session_id": req.session_id,
-        "name": (req.name or "").strip(),
-        "phone": (req.phone or "").strip(),
-        "email": (req.email or "").strip(),
-        "message": (req.message or "").strip(),
-        "preferred_contact": (req.preferred_contact or "").strip(),
-        "status": "open",
+        "id": ticket_id,                         # uuid
+        "session_id": req.session_id,            # uuid
+        "airstream_year": getattr(req, "airstream_year", None),
+        "issue_summary": issue_summary,          # NOT NULL ✅
+        "location": getattr(req, "location", None),
+        "trigger": getattr(req, "trigger", None) or "user_escalation",
+        "name": (req.name or "").strip() or None,
+        "contact": contact,
+        "preferred_contact": (req.preferred_contact or "").strip() or None,
+        "conversation_excerpt": excerpt,
+        # status exists in your table with default 'new'. You can omit it safely.
+        # If you WANT a value, use 'new' / 'open' / etc — but omit is safest.
         "routing": routing,
         "business_hours": open_now,
         "conversation_id": conversation_id,
+        "handled_at": None,
+        "transcript": getattr(req, "transcript", None),
+        "context_json": getattr(req, "context_json", None),
     }
 
     try:
@@ -1591,16 +1615,20 @@ def create_escalation(req: EscalationRequest):
         except Exception:
             pass
 
+        # Minimal row that still satisfies NOT NULL constraints in your schema
         minimal_row = {
             "id": ticket_id,
             "session_id": req.session_id,
-            "name": (req.name or "").strip(),
-            "phone": (req.phone or "").strip(),
-            "email": (req.email or "").strip(),
-            "message": (req.message or "").strip(),
-            "preferred_contact": (req.preferred_contact or "").strip(),
-            "status": "open",
+            "issue_summary": issue_summary,  # NOT NULL ✅
+            "name": (req.name or "").strip() or None,
+            "contact": contact,
+            "preferred_contact": (req.preferred_contact or "").strip() or None,
+            "routing": routing,
+            "business_hours": open_now,
+            "conversation_id": conversation_id,
+            "conversation_excerpt": excerpt,
         }
+
         try:
             sb_post("escalations", [minimal_row])
         except Exception as e2:
@@ -1626,16 +1654,16 @@ def create_escalation(req: EscalationRequest):
 
     email_subject = build_escalation_email_subject(req.session_id)
     email_body = (
-        "Vinnies Brain — Escalation"
-        f"Session ID: {req.session_id}"
-        f"Business hours at submit: {'YES' if open_now else 'NO'}"
-        "Customer info"
-        f"Name: {req.name}"
-        + (f"Email: {req.email}" if (req.email or '').strip() else "")
-        + (f"Phone: {req.phone}" if (req.phone or '').strip() else "")
-        + f"Preferred contact: {req.preferred_contact}"
-        "Issue summary"
-        + (req.message or "")
+        "Vinnies Brain — Escalation\n\n"
+        f"Session ID: {req.session_id}\n"
+        f"Business hours at submit: {'YES' if open_now else 'NO'}\n\n"
+        "Customer info\n"
+        f"Name: {req.name}\n"
+        + (f"Email: {req.email}\n" if (req.email or '').strip() else "")
+        + (f"Phone: {req.phone}\n" if (req.phone or '').strip() else "")
+        + (f"Preferred contact: {req.preferred_contact}\n" if (req.preferred_contact or '').strip() else "")
+        + "\nIssue summary\n"
+        + issue_summary
     ).strip()
 
     return {
@@ -1648,6 +1676,7 @@ def create_escalation(req: EscalationRequest):
         "email_subject": email_subject,
         "email_body": email_body,
     }
+
 
 
 @app.post("/v1/owner/push-token")
