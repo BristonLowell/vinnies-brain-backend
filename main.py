@@ -1615,7 +1615,10 @@ def create_escalation(req: EscalationRequest, request: Request):
         conn.commit()
 
     # ✅ Supabase escalation row (admin dashboard source of truth)
-    escalation_row = {
+    #
+    # IMPORTANT: Different Supabase setups may not have all optional columns (e.g. transcript, context_json).
+    # We first try to insert a "full" row, then fall back to a minimal row if Supabase returns a 400.
+    full_row = {
         "id": ticket_id,
         "session_id": req.session_id,
         "name": (req.name or "").strip(),
@@ -1627,15 +1630,30 @@ def create_escalation(req: EscalationRequest, request: Request):
         "routing": routing,
         "business_hours": open_now,
         "conversation_id": conversation_id,
+        # Optional extras (safe to omit if your table doesn't have these columns)
         "context_json": ctx,
         "transcript": transcript,
     }
 
+    minimal_row = {
+        "id": ticket_id,
+        "session_id": req.session_id,
+        "name": (req.name or "").strip(),
+        "phone": (req.phone or "").strip(),
+        "email": (req.email or "").strip(),
+        "message": (req.message or "").strip(),
+        "preferred_contact": (req.preferred_contact or "").strip(),
+        "status": "open",
+    }
+
     try:
-        _ = sb_post("escalations", [escalation_row])
+        _ = sb_post("escalations", [full_row])
     except Exception:
-        # Don't block the customer UX if Supabase has a hiccup; the ticket_id still exists.
-        pass
+        try:
+            _ = sb_post("escalations", [minimal_row])
+        except Exception:
+            # Don't block the customer UX if Supabase has a hiccup; the ticket_id still exists.
+            pass
 
     # Notify owner via push for faster response (optional; safe if token missing)
     try:
@@ -1729,15 +1747,29 @@ def admin_list_escalations(
 ):
     require_admin(x_admin_key)
 
+    # Try a "full" select first (for newer schemas), and fall back to a minimal select
+    # if the Supabase table doesn't have the optional columns yet.
+    full_select = "id,session_id,name,phone,email,message,preferred_contact,status,routing,business_hours,conversation_id,created_at,handled_at"
+    minimal_select = "id,session_id,name,phone,email,message,preferred_contact,status,created_at"
+
     params: Dict[str, str] = {
-        "select": "id,session_id,name,phone,email,message,preferred_contact,status,routing,business_hours,conversation_id,created_at,handled_at",
+        "select": full_select,
         "order": "created_at.desc",
         "limit": "300",
     }
     if status.strip():
         params["status"] = f"eq.{status.strip()}"
 
-    rows = sb_get("escalations", params)
+    try:
+        rows = sb_get("escalations", params)
+    except HTTPException as e:
+        # If Supabase returns a 400 due to missing columns, retry with minimal select.
+        if "Supabase GET escalations failed: 400" in str(getattr(e, "detail", "")) or " 400 " in str(getattr(e, "detail", "")):
+            params["select"] = minimal_select
+            rows = sb_get("escalations", params)
+        else:
+            raise
+
     out = []
     for r in (rows or []):
         msg = (r.get("message") or "").strip()
@@ -1926,46 +1958,4 @@ def sb_patch(table: str, payload: Any, filters: Dict[str, str], prefer: str = "r
             return json.loads(resp.read().decode("utf-8"))
 
 
-# -------------------------
-# Admin: Escalations (ADD THIS)
-# -------------------------
-@app.get("/v1/admin/escalations")
-def admin_list_escalations(
-    x_admin_key: str = Header(default="", alias="X-Admin-Key"),
-    limit: int = 200,
-):
-    require_admin(x_admin_key)
-
-    # Assumes you have a Supabase table named "escalations"
-    rows = sb_get(
-        "escalations",
-        {
-            "select": "*",
-            "order": "created_at.desc",
-            "limit": str(max(1, min(int(limit), 500))),
-        },
-    )
-    return {"escalations": rows or []}
-
-
-@app.patch("/v1/admin/escalations/{escalation_id}")
-def admin_update_escalation_status(
-    escalation_id: str,
-    req: dict,
-    x_admin_key: str = Header(default="", alias="X-Admin-Key"),
-):
-    require_admin(x_admin_key)
-
-    status = str(req.get("status", "")).strip()
-    if status not in {"open", "in_progress", "closed"}:
-        raise HTTPException(status_code=400, detail="Invalid status")
-
-    updated = sb_patch(
-        "escalations",
-        {"status": status},
-        {"id": f"eq.{escalation_id}"},
-    )
-    # Supabase returns an array when Prefer=return=representation
-    item = (updated[0] if isinstance(updated, list) and updated else None)
-    return {"ok": True, "escalation": item}
 
