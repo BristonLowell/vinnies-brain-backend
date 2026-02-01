@@ -268,18 +268,20 @@ def _sb_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
 
 def sb_get(table: str, params: Dict[str, str]) -> Any:
     url = f"{SUPABASE_URL}/rest/v1/{table}"
-    qs = urlencode(params)
-    full = f"{url}?{qs}" if qs else url
 
     if requests is not None:
-        r = requests.get(full, headers=_sb_headers(), timeout=15)
+        # Use requests params handling to avoid subtle URL encoding issues.
+        r = requests.get(url, headers=_sb_headers(), params=params, timeout=15)
         if not r.ok:
             raise HTTPException(status_code=502, detail=f"Supabase GET {table} failed: {r.status_code} {r.text}")
         return r.json()
     else:
+        qs = urlencode(params)
+        full = f"{url}?{qs}" if qs else url
         req = urllib.request.Request(full, headers=_sb_headers(), method="GET")
         with urllib.request.urlopen(req, timeout=15) as resp:
             return json.loads(resp.read().decode("utf-8"))
+
 
 
 def sb_post(table: str, payload: Any, prefer: str = "return=representation") -> Any:
@@ -1615,10 +1617,7 @@ def create_escalation(req: EscalationRequest, request: Request):
         conn.commit()
 
     # ✅ Supabase escalation row (admin dashboard source of truth)
-    #
-    # IMPORTANT: Different Supabase setups may not have all optional columns (e.g. transcript, context_json).
-    # We first try to insert a "full" row, then fall back to a minimal row if Supabase returns a 400.
-    full_row = {
+    escalation_row = {
         "id": ticket_id,
         "session_id": req.session_id,
         "name": (req.name or "").strip(),
@@ -1630,30 +1629,33 @@ def create_escalation(req: EscalationRequest, request: Request):
         "routing": routing,
         "business_hours": open_now,
         "conversation_id": conversation_id,
-        # Optional extras (safe to omit if your table doesn't have these columns)
         "context_json": ctx,
         "transcript": transcript,
     }
 
-    minimal_row = {
-        "id": ticket_id,
-        "session_id": req.session_id,
-        "name": (req.name or "").strip(),
-        "phone": (req.phone or "").strip(),
-        "email": (req.email or "").strip(),
-        "message": (req.message or "").strip(),
-        "preferred_contact": (req.preferred_contact or "").strip(),
-        "status": "open",
-    }
-
     try:
-        _ = sb_post("escalations", [full_row])
-    except Exception:
+        _ = sb_post("escalations", [escalation_row])
+    except HTTPException as e:
+        # If Supabase rejects optional columns (schema mismatch), retry with a minimal payload.
+        detail = str(getattr(e, "detail", ""))
+        logger.warning("Supabase escalation insert failed (full payload). %s", detail)
+        minimal_row = {
+            "id": ticket_id,
+            "session_id": req.session_id,
+            "name": (req.name or "").strip(),
+            "phone": (req.phone or "").strip(),
+            "email": (req.email or "").strip(),
+            "message": (req.message or "").strip(),
+            "preferred_contact": (req.preferred_contact or "").strip(),
+            "status": "open",
+        }
         try:
             _ = sb_post("escalations", [minimal_row])
-        except Exception:
-            # Don't block the customer UX if Supabase has a hiccup; the ticket_id still exists.
-            pass
+        except Exception as e2:
+            # Don't block the customer UX if Supabase has a hiccup; but log it so we can fix it.
+            logger.exception("Supabase escalation insert failed (minimal payload): %s", e2)
+    except Exception as e:
+        logger.exception("Supabase escalation insert failed (unexpected): %s", e)
 
     # Notify owner via push for faster response (optional; safe if token missing)
     try:
@@ -1747,13 +1749,10 @@ def admin_list_escalations(
 ):
     require_admin(x_admin_key)
 
-    # Try a "full" select first (for newer schemas), and fall back to a minimal select
-    # if the Supabase table doesn't have the optional columns yet.
-    full_select = "id,session_id,name,phone,email,message,preferred_contact,status,routing,business_hours,conversation_id,created_at,handled_at"
-    minimal_select = "id,session_id,name,phone,email,message,preferred_contact,status,created_at"
-
+    # Be schema-tolerant: select all columns so the endpoint keeps working even if the Supabase table
+    # has fewer/more columns than the app expects.
     params: Dict[str, str] = {
-        "select": full_select,
+        "select": "*",
         "order": "created_at.desc",
         "limit": "300",
     }
@@ -1763,19 +1762,27 @@ def admin_list_escalations(
     try:
         rows = sb_get("escalations", params)
     except HTTPException as e:
-        # If Supabase returns a 400 due to missing columns, retry with minimal select.
-        if "Supabase GET escalations failed: 400" in str(getattr(e, "detail", "")) or " 400 " in str(getattr(e, "detail", "")):
-            params["select"] = minimal_select
+        # If the failure is due to the order clause (or any query parsing issue), retry without ordering.
+        detail = str(getattr(e, "detail", ""))
+        if "Supabase GET escalations failed: 400" in detail:
+            params.pop("order", None)
             rows = sb_get("escalations", params)
         else:
             raise
 
     out = []
     for r in (rows or []):
-        msg = (r.get("message") or "").strip()
-        r["message_preview"] = (msg[:140] + "…") if len(msg) > 140 else msg
+        # Add a UI-friendly preview without requiring the column to exist in Supabase
+        try:
+            msg = (r.get("message") or "").strip()
+            r["message_preview"] = (msg[:140] + "…") if len(msg) > 140 else msg
+        except Exception:
+            pass
         out.append(r)
+
     return {"escalations": out}
+
+
 
 
 class AdminUpdateEscalationRequest(BaseModel):
@@ -1956,6 +1963,5 @@ def sb_patch(table: str, payload: Any, filters: Dict[str, str], prefer: str = "r
         req = urllib.request.Request(full, headers=headers, data=data, method="PATCH")
         with urllib.request.urlopen(req, timeout=15) as resp:
             return json.loads(resp.read().decode("utf-8"))
-
 
 
