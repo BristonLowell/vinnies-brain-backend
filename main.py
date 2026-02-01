@@ -268,20 +268,18 @@ def _sb_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
 
 def sb_get(table: str, params: Dict[str, str]) -> Any:
     url = f"{SUPABASE_URL}/rest/v1/{table}"
+    qs = urlencode(params)
+    full = f"{url}?{qs}" if qs else url
 
     if requests is not None:
-        # Use requests params handling to avoid subtle URL encoding issues.
-        r = requests.get(url, headers=_sb_headers(), params=params, timeout=15)
+        r = requests.get(full, headers=_sb_headers(), timeout=15)
         if not r.ok:
             raise HTTPException(status_code=502, detail=f"Supabase GET {table} failed: {r.status_code} {r.text}")
         return r.json()
     else:
-        qs = urlencode(params)
-        full = f"{url}?{qs}" if qs else url
         req = urllib.request.Request(full, headers=_sb_headers(), method="GET")
         with urllib.request.urlopen(req, timeout=15) as resp:
             return json.loads(resp.read().decode("utf-8"))
-
 
 
 def sb_post(table: str, payload: Any, prefer: str = "return=representation") -> Any:
@@ -1544,80 +1542,33 @@ def chat(req: ChatRequest):
 
 
 @app.post("/v1/escalations", response_model=EscalationResponse)
-def create_escalation(req: EscalationRequest, request: Request):
+def create_escalation(req: EscalationRequest):
+    """Create an escalation ticket and persist it to Supabase (table: escalations).
+
+    Important: we do NOT block the customer flow if Supabase insert fails.
+    We return a ticket_id regardless so the frontend confirmation still works.
+    """
     ticket_id = str(uuid.uuid4())
+
+    # Determine routing based on preferred_contact (keep loose to match existing client behavior)
+    pc = (req.preferred_contact or "").strip().lower()
+    if pc == "email":
+        routing = "email"
+    elif pc in {"both", "chat+email", "chat_and_email"}:
+        routing = "both"
+    else:
+        routing = "chat"
+
     open_now = is_business_hours_now()
 
-    pref = (req.preferred_contact or "").strip().lower()
-    wants_email = pref == "email" or bool((req.email or "").strip())
-
-    # Routing rules:
-    # - After hours: email only
-    # - During business hours: default to live chat, but email is available if user chose Email
-    routing = "email" if (not open_now) else ("email" if wants_email else "chat")
-
-    conversation_id: Optional[str] = None
-    transcript = ""
-    ctx: Dict[str, Any] = {}
-
-    with db() as conn:
-        sess = get_session(conn, req.session_id)
-        history = get_recent_messages(conn, req.session_id, limit=250)
-        transcript = format_transcript(history, max_chars=9000)
-
-        ctx = {
-            "airstream_year": sess.get("airstream_year"),
-            "category": sess.get("category"),
-            "history": history,
-        }
-
-        # ✅ Keep existing Postgres insert (does not break current functionality)
+    conversation_id = None
+    if routing in {"chat", "both"}:
         try:
-            exec_no_return(
-                conn,
-                """
-                INSERT INTO escalations (id, session_id, name, phone, email, message, preferred_contact, context_json)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
-                """,
-                (
-                    ticket_id,
-                    req.session_id,
-                    req.name,
-                    req.phone,
-                    req.email,
-                    req.message,
-                    req.preferred_contact,
-                    json.dumps(ctx),
-                ),
-            )
+            conversation_id = get_or_create_conversation_for_session(req.session_id)
         except Exception:
-            # Some deployments may not have the Postgres escalations table; Supabase is the new source of truth.
-            pass
+            conversation_id = None
 
-        # If we're open and routing to chat, ensure a live chat conversation exists so the owner can jump in.
-        if routing == "chat":
-            try:
-                conversation_id = get_or_create_conversation_for_session(req.session_id)
-            except Exception:
-                conversation_id = None
-
-        # Optional reset: start a fresh troubleshooting state after escalation
-        if req.reset_old:
-            try:
-                updates = []
-                if sessions_supports_pinning(conn):
-                    updates.append("active_article_id=NULL, active_node_id=NULL, active_tree=NULL")
-                if sessions_supports_active_question(conn):
-                    updates.append("active_question_text=NULL")
-                if updates:
-                    exec_no_return(conn, f"UPDATE sessions SET {', '.join(updates)} WHERE id=%s", (req.session_id,))
-            except Exception:
-                pass
-
-        conn.commit()
-
-    # ✅ Supabase escalation row (admin dashboard source of truth)
-    escalation_row = {
+    full_row = {
         "id": ticket_id,
         "session_id": req.session_id,
         "name": (req.name or "").strip(),
@@ -1629,16 +1580,17 @@ def create_escalation(req: EscalationRequest, request: Request):
         "routing": routing,
         "business_hours": open_now,
         "conversation_id": conversation_id,
-        "context_json": ctx,
-        "transcript": transcript,
     }
 
     try:
-        _ = sb_post("escalations", [escalation_row])
-    except HTTPException as e:
-        # If Supabase rejects optional columns (schema mismatch), retry with a minimal payload.
-        detail = str(getattr(e, "detail", ""))
-        logger.warning("Supabase escalation insert failed (full payload). %s", detail)
+        sb_post("escalations", [full_row])
+    except Exception as e:
+        # Log for debugging; do not block customer UX
+        try:
+            print(f"Supabase escalation insert failed (full payload): {e}")
+        except Exception:
+            pass
+
         minimal_row = {
             "id": ticket_id,
             "session_id": req.session_id,
@@ -1650,28 +1602,41 @@ def create_escalation(req: EscalationRequest, request: Request):
             "status": "open",
         }
         try:
-            _ = sb_post("escalations", [minimal_row])
+            sb_post("escalations", [minimal_row])
         except Exception as e2:
-            # Don't block the customer UX if Supabase has a hiccup; but log it so we can fix it.
-            logger.exception("Supabase escalation insert failed (minimal payload): %s", e2)
-    except Exception as e:
-        logger.exception("Supabase escalation insert failed (unexpected): %s", e)
+            try:
+                print(f"Supabase escalation insert failed (minimal payload): {e2}")
+            except Exception:
+                pass
 
-    # Notify owner via push for faster response (optional; safe if token missing)
-    try:
-        token = get_owner_push_token(OWNER_SUPABASE_USER_ID) if OWNER_SUPABASE_USER_ID else None
-        if token:
-            send_expo_push(
-                token,
-                title="New escalation",
-                body=(req.message or "").strip()[:120] or "New escalation received",
-                data={"session_id": req.session_id, "ticket_id": ticket_id, "conversation_id": conversation_id},
-            )
-    except Exception:
-        pass
+    # Optional reset: start fresh after escalation
+    if req.reset_old:
+        try:
+            with db() as conn:
+                updates = []
+                if sessions_supports_pinning(conn):
+                    updates.append("active_article_id=NULL, active_node_id=NULL, active_tree=NULL")
+                if sessions_supports_active_question(conn):
+                    updates.append("active_question_text=NULL")
+                if updates:
+                    exec_no_return(conn, f"UPDATE sessions SET {', '.join(updates)} WHERE id=%s", (req.session_id,))
+                    conn.commit()
+        except Exception:
+            pass
 
     email_subject = build_escalation_email_subject(req.session_id)
-    email_body = build_escalation_email_body(req=req, transcript=transcript, business_hours=open_now)
+    email_body = (
+        "Vinnies Brain — Escalation"
+        f"Session ID: {req.session_id}"
+        f"Business hours at submit: {'YES' if open_now else 'NO'}"
+        "Customer info"
+        f"Name: {req.name}"
+        + (f"Email: {req.email}" if (req.email or '').strip() else "")
+        + (f"Phone: {req.phone}" if (req.phone or '').strip() else "")
+        + f"Preferred contact: {req.preferred_contact}"
+        "Issue summary"
+        + (req.message or "")
+    ).strip()
 
     return {
         "ticket_id": ticket_id,
@@ -1683,7 +1648,6 @@ def create_escalation(req: EscalationRequest, request: Request):
         "email_subject": email_subject,
         "email_body": email_body,
     }
-
 
 
 @app.post("/v1/owner/push-token")
@@ -1749,40 +1713,21 @@ def admin_list_escalations(
 ):
     require_admin(x_admin_key)
 
-    # Be schema-tolerant: select all columns so the endpoint keeps working even if the Supabase table
-    # has fewer/more columns than the app expects.
     params: Dict[str, str] = {
-        "select": "*",
+        "select": "id,session_id,name,phone,email,message,preferred_contact,status,routing,business_hours,conversation_id,created_at,handled_at",
         "order": "created_at.desc",
         "limit": "300",
     }
     if status.strip():
         params["status"] = f"eq.{status.strip()}"
 
-    try:
-        rows = sb_get("escalations", params)
-    except HTTPException as e:
-        # If the failure is due to the order clause (or any query parsing issue), retry without ordering.
-        detail = str(getattr(e, "detail", ""))
-        if "Supabase GET escalations failed: 400" in detail:
-            params.pop("order", None)
-            rows = sb_get("escalations", params)
-        else:
-            raise
-
+    rows = sb_get("escalations", params)
     out = []
     for r in (rows or []):
-        # Add a UI-friendly preview without requiring the column to exist in Supabase
-        try:
-            msg = (r.get("message") or "").strip()
-            r["message_preview"] = (msg[:140] + "…") if len(msg) > 140 else msg
-        except Exception:
-            pass
+        msg = (r.get("message") or "").strip()
+        r["message_preview"] = (msg[:140] + "…") if len(msg) > 140 else msg
         out.append(r)
-
     return {"escalations": out}
-
-
 
 
 class AdminUpdateEscalationRequest(BaseModel):
@@ -1964,4 +1909,47 @@ def sb_patch(table: str, payload: Any, filters: Dict[str, str], prefer: str = "r
         with urllib.request.urlopen(req, timeout=15) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
+
+# -------------------------
+# Admin: Escalations (ADD THIS)
+# -------------------------
+@app.get("/v1/admin/escalations")
+def admin_list_escalations(
+    x_admin_key: str = Header(default="", alias="X-Admin-Key"),
+    limit: int = 200,
+):
+    require_admin(x_admin_key)
+
+    # Assumes you have a Supabase table named "escalations"
+    rows = sb_get(
+        "escalations",
+        {
+            "select": "*",
+            "order": "created_at.desc",
+            "limit": str(max(1, min(int(limit), 500))),
+        },
+    )
+    return {"escalations": rows or []}
+
+
+@app.patch("/v1/admin/escalations/{escalation_id}")
+def admin_update_escalation_status(
+    escalation_id: str,
+    req: dict,
+    x_admin_key: str = Header(default="", alias="X-Admin-Key"),
+):
+    require_admin(x_admin_key)
+
+    status = str(req.get("status", "")).strip()
+    if status not in {"open", "in_progress", "closed"}:
+        raise HTTPException(status_code=400, detail="Invalid status")
+
+    updated = sb_patch(
+        "escalations",
+        {"status": status},
+        {"id": f"eq.{escalation_id}"},
+    )
+    # Supabase returns an array when Prefer=return=representation
+    item = (updated[0] if isinstance(updated, list) and updated else None)
+    return {"ok": True, "escalation": item}
 
