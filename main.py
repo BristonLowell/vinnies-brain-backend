@@ -1541,13 +1541,17 @@ def chat(req: ChatRequest):
         )
 
 
+
 @app.post("/v1/escalations", response_model=EscalationResponse)
 def create_escalation(req: EscalationRequest):
-    """
-    Create an escalation ticket and persist it to Supabase (table: escalations).
+    """Create an escalation ticket and persist it to Supabase (table: escalations).
 
     Important: we do NOT block the customer flow if Supabase insert fails.
     We return a ticket_id regardless so the frontend confirmation still works.
+
+    NOTE: Supabase schema (public.escalations) uses:
+      - issue_summary (NOT NULL) instead of "message"
+      - contact (instead of separate email/phone columns)
     """
     ticket_id = str(uuid.uuid4())
 
@@ -1562,80 +1566,78 @@ def create_escalation(req: EscalationRequest):
 
     open_now = is_business_hours_now()
 
-    conversation_id = None
+    conversation_id: Optional[str] = None
     if routing in {"chat", "both"}:
         try:
             conversation_id = get_or_create_conversation_for_session(req.session_id)
         except Exception:
             conversation_id = None
 
-    # ---- Map request -> DB schema (YOUR TABLE) ----
-    issue_summary = (req.message or "").strip()
-    # issue_summary is NOT NULL in your table, so ensure it has something
-    if not issue_summary:
-        issue_summary = "Escalation requested (no message provided)."
+    # Pull a little context (optional) from local chat log
+    airstream_year: Optional[int] = None
+    excerpt: Optional[str] = None
+    try:
+        with db() as conn:
+            srow = exec_one(conn, "SELECT airstream_year FROM sessions WHERE id=%s", (req.session_id,))
+            if srow and srow.get("airstream_year") is not None:
+                try:
+                    airstream_year = int(srow.get("airstream_year"))
+                except Exception:
+                    airstream_year = None
 
-    # Supabase table has single "contact" field (text). We'll combine email/phone if present.
-    contact_parts = []
+            mrows = exec_all(
+                conn,
+                "SELECT role, content, created_at FROM chat_messages WHERE session_id=%s ORDER BY created_at DESC LIMIT 12",
+                (req.session_id,),
+            )
+            if mrows:
+                lines = []
+                for r in reversed(mrows):
+                    role = (r.get("role") or "").strip() or "user"
+                    content = (r.get("content") or "").strip()
+                    if content:
+                        lines.append(f"{role}: {content}")
+                joined = "\n".join(lines).strip()
+                if joined:
+                    excerpt = joined[:4000]
+    except Exception:
+        pass
+
+    # Supabase escalations row (match your actual table schema)
+    contact = ""
     if (req.email or "").strip():
-        contact_parts.append(f"email: {(req.email or '').strip()}")
-    if (req.phone or "").strip():
-        contact_parts.append(f"phone: {(req.phone or '').strip()}")
-    contact = " | ".join(contact_parts) if contact_parts else None
-
-    excerpt = issue_summary[:280]  # optional; your table has conversation_excerpt
+        contact = (req.email or "").strip()
+    elif (req.phone or "").strip():
+        contact = (req.phone or "").strip()
 
     full_row = {
-        "id": ticket_id,                         # uuid
-        "session_id": req.session_id,            # uuid
-        "airstream_year": getattr(req, "airstream_year", None),
-        "issue_summary": issue_summary,          # NOT NULL ✅
-        "location": getattr(req, "location", None),
-        "trigger": getattr(req, "trigger", None) or "user_escalation",
+        "id": ticket_id,  # uuid string
+        "session_id": req.session_id,  # uuid string
+        "airstream_year": airstream_year,
+        "issue_summary": (req.message or "").strip(),  # NOT NULL
         "name": (req.name or "").strip() or None,
-        "contact": contact,
+        "contact": contact or None,
         "preferred_contact": (req.preferred_contact or "").strip() or None,
         "conversation_excerpt": excerpt,
-        # status exists in your table with default 'new'. You can omit it safely.
-        # If you WANT a value, use 'new' / 'open' / etc — but omit is safest.
+        "status": "new",  # matches your table default
         "routing": routing,
         "business_hours": open_now,
         "conversation_id": conversation_id,
-        "handled_at": None,
-        "transcript": getattr(req, "transcript", None),
-        "context_json": getattr(req, "context_json", None),
+        "context_json": {
+            "source": "mobile",
+            "routing": routing,
+            "business_hours": open_now,
+        },
     }
 
     try:
-        sb_post("escalations", [full_row])
+        _ = sb_post("escalations", [full_row])
     except Exception as e:
         # Log for debugging; do not block customer UX
         try:
-            print(f"Supabase escalation insert failed (full payload): {e}")
+            print(f"Supabase escalation insert failed: {e}")
         except Exception:
             pass
-
-        # Minimal row that still satisfies NOT NULL constraints in your schema
-        minimal_row = {
-            "id": ticket_id,
-            "session_id": req.session_id,
-            "issue_summary": issue_summary,  # NOT NULL ✅
-            "name": (req.name or "").strip() or None,
-            "contact": contact,
-            "preferred_contact": (req.preferred_contact or "").strip() or None,
-            "routing": routing,
-            "business_hours": open_now,
-            "conversation_id": conversation_id,
-            "conversation_excerpt": excerpt,
-        }
-
-        try:
-            sb_post("escalations", [minimal_row])
-        except Exception as e2:
-            try:
-                print(f"Supabase escalation insert failed (minimal payload): {e2}")
-            except Exception:
-                pass
 
     # Optional reset: start fresh after escalation
     if req.reset_old:
@@ -1654,16 +1656,17 @@ def create_escalation(req: EscalationRequest):
 
     email_subject = build_escalation_email_subject(req.session_id)
     email_body = (
-        "Vinnies Brain — Escalation\n\n"
+        "Vinnies Brain — Escalation\n"
         f"Session ID: {req.session_id}\n"
+        f"Airstream year: {airstream_year if airstream_year is not None else ''}\n"
         f"Business hours at submit: {'YES' if open_now else 'NO'}\n\n"
         "Customer info\n"
         f"Name: {req.name}\n"
         + (f"Email: {req.email}\n" if (req.email or '').strip() else "")
         + (f"Phone: {req.phone}\n" if (req.phone or '').strip() else "")
-        + (f"Preferred contact: {req.preferred_contact}\n" if (req.preferred_contact or '').strip() else "")
-        + "\nIssue summary\n"
-        + issue_summary
+        + f"Preferred contact: {req.preferred_contact}\n\n"
+        "Issue summary\n"
+        + (req.message or "")
     ).strip()
 
     return {
@@ -1676,7 +1679,6 @@ def create_escalation(req: EscalationRequest):
         "email_subject": email_subject,
         "email_body": email_body,
     }
-
 
 
 @app.post("/v1/owner/push-token")
@@ -1735,6 +1737,7 @@ def admin_create_article(req: AdminArticleRequest, x_admin_key: str = Header(def
             raise HTTPException(status_code=500, detail=f"Failed to create article: {e}")
 
 
+
 @app.get("/v1/admin/escalations")
 def admin_list_escalations(
     status: str = "",
@@ -1742,8 +1745,9 @@ def admin_list_escalations(
 ):
     require_admin(x_admin_key)
 
+    # Your Supabase table: public.escalations (issue_summary/contact/etc.)
     params: Dict[str, str] = {
-        "select": "id,session_id,name,phone,email,message,preferred_contact,status,routing,business_hours,conversation_id,created_at,handled_at",
+        "select": "id,session_id,airstream_year,issue_summary,location,trigger,name,contact,preferred_contact,conversation_excerpt,status,created_at,routing,business_hours,conversation_id,handled_at,transcript,context_json",
         "order": "created_at.desc",
         "limit": "300",
     }
@@ -1751,12 +1755,26 @@ def admin_list_escalations(
         params["status"] = f"eq.{status.strip()}"
 
     rows = sb_get("escalations", params)
-    out = []
+
+    # Back-compat mapping so existing admin-inbox.tsx can keep using message/email/phone fields
+    out: List[Dict[str, Any]] = []
     for r in (rows or []):
-        msg = (r.get("message") or "").strip()
-        r["message_preview"] = (msg[:140] + "…") if len(msg) > 140 else msg
+        issue = (r.get("issue_summary") or "").strip()
+        contact = (r.get("contact") or "").strip()
+
+        r["message"] = r.get("message") or issue
+        if contact:
+            if "@" in contact and not r.get("email"):
+                r["email"] = contact
+            elif not r.get("phone"):
+                r["phone"] = contact
+
+        r["message_preview"] = (issue[:140] + "…") if len(issue) > 140 else issue
         out.append(r)
+
     return {"escalations": out}
+
+
 
 
 class AdminUpdateEscalationRequest(BaseModel):
@@ -1918,67 +1936,4 @@ def admin_delete_livechat_conversation(conversation_id: str, x_admin_key: str = 
 
     return {"ok": True}
 
-# -------------------------
-# Supabase REST helpers (ADD THIS)
-# -------------------------
-def sb_patch(table: str, payload: Any, filters: Dict[str, str], prefer: str = "return=representation") -> Any:
-    url = f"{SUPABASE_URL}/rest/v1/{table}"
-    qs = urlencode(filters or {})
-    full = f"{url}?{qs}" if qs else url
-    headers = _sb_headers({"Prefer": prefer})
-
-    if requests is not None:
-        r = requests.patch(full, headers=headers, json=payload, timeout=15)
-        if not r.ok:
-            raise HTTPException(status_code=502, detail=f"Supabase PATCH {table} failed: {r.status_code} {r.text}")
-        return r.json()
-    else:
-        data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(full, headers=headers, data=data, method="PATCH")
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-
-
-# -------------------------
-# Admin: Escalations (ADD THIS)
-# -------------------------
-@app.get("/v1/admin/escalations")
-def admin_list_escalations(
-    x_admin_key: str = Header(default="", alias="X-Admin-Key"),
-    limit: int = 200,
-):
-    require_admin(x_admin_key)
-
-    # Assumes you have a Supabase table named "escalations"
-    rows = sb_get(
-        "escalations",
-        {
-            "select": "*",
-            "order": "created_at.desc",
-            "limit": str(max(1, min(int(limit), 500))),
-        },
-    )
-    return {"escalations": rows or []}
-
-
-@app.patch("/v1/admin/escalations/{escalation_id}")
-def admin_update_escalation_status(
-    escalation_id: str,
-    req: dict,
-    x_admin_key: str = Header(default="", alias="X-Admin-Key"),
-):
-    require_admin(x_admin_key)
-
-    status = str(req.get("status", "")).strip()
-    if status not in {"open", "in_progress", "closed"}:
-        raise HTTPException(status_code=400, detail="Invalid status")
-
-    updated = sb_patch(
-        "escalations",
-        {"status": status},
-        {"id": f"eq.{escalation_id}"},
-    )
-    # Supabase returns an array when Prefer=return=representation
-    item = (updated[0] if isinstance(updated, list) and updated else None)
-    return {"ok": True, "escalation": item}
 
