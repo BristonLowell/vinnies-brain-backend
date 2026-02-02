@@ -41,6 +41,14 @@ OWNER_SUPABASE_USER_ID = os.getenv("OWNER_SUPABASE_USER_ID", "").strip()
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", os.getenv("ADMIN_KEY", "")).strip()
 
 # =========================
+# RevenueCat (Subscriptions)
+# =========================
+REVENUECAT_WEBHOOK_AUTH = os.getenv("REVENUECAT_WEBHOOK_AUTH", "").strip()
+REVENUECAT_SECRET_API_KEY_V1 = os.getenv("REVENUECAT_SECRET_API_KEY_V1", "").strip()
+REVENUECAT_ENTITLEMENT_ID = os.getenv("REVENUECAT_ENTITLEMENT_ID", "pro").strip()
+
+
+# =========================
 # App + DB helpers
 # =========================
 app = FastAPI()
@@ -194,6 +202,60 @@ SUPPORT_CLOSE_HOUR = int(os.getenv("SUPPORT_CLOSE_HOUR", "17"))  # 5pm
 # 0=Mon ... 6=Sun
 SUPPORT_DAYS_OPEN = os.getenv("SUPPORT_DAYS_OPEN", "0,1,2,3,4")  # Mon–Fri
 SUPPORT_EMAIL_TO = os.getenv("SUPPORT_EMAIL_TO", "info@vinnies.net")
+
+@app.post("/v1/billing/revenuecat/webhook")
+async def revenuecat_webhook(request: Request, authorization: str = Header(default="", alias="Authorization")):
+    """
+    RevenueCat recommends setting an Authorization header value in their dashboard
+    and validating it in your server:contentReference[oaicite:12]{index=12}.
+    """
+    if not REVENUECAT_WEBHOOK_AUTH:
+        raise HTTPException(status_code=500, detail="REVENUECAT_WEBHOOK_AUTH is not set on the server.")
+
+    if (authorization or "").strip() != REVENUECAT_WEBHOOK_AUTH:
+        raise HTTPException(status_code=401, detail="Unauthorized webhook")
+
+    body = await request.json()
+
+    # app_user_id should be the stable ID you log into RevenueCat with.
+    # Best practice for your setup: use the Supabase user id (UUID) as RevenueCat app_user_id.
+    app_user_id = (body.get("app_user_id") or "").strip()
+    if not app_user_id:
+        return {"ok": True, "ignored": True}
+
+    # Fetch canonical status from RevenueCat API (don’t trust event ordering alone)
+    sub = rc_get_subscriber(app_user_id)
+    is_active, expires_at = rc_entitlement_status(sub)
+
+    # Store in Supabase profiles
+    upsert_profile_subscription(
+        user_id=app_user_id,
+        is_subscribed=is_active,
+        expires_at_iso=expires_at,
+        rc_app_user_id=app_user_id,
+    )
+
+    return {"ok": True}
+
+
+@app.get("/v1/billing/status")
+def billing_status(request: Request):
+    """
+    App can call this to quickly learn if the current user is subscribed.
+    Uses your existing temporary auth bridge: X-User-Id:contentReference[oaicite:13]{index=13}.
+    """
+    user_id = (request.headers.get("X-User-Id") or "").strip()
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Not authenticated (missing X-User-Id)")
+
+    rows = sb_get("profiles", {"select": "id,is_subscribed,subscription_expires_at,rc_app_user_id", "id": f"eq.{user_id}", "limit": "1"})
+    row = (rows or [{}])[0] if isinstance(rows, list) and rows else {}
+    return {
+    "user_id": user_id,
+    "is_subscribed": bool(row.get("is_subscribed")),
+    "subscription_expires_at": row.get("subscription_expires_at"),
+}
+
 
 
 def _pt_now() -> datetime:
@@ -357,6 +419,78 @@ def sb_delete(table: str, params: Dict[str, str], prefer: str = "return=minimal"
                 return json.loads(raw)
             except Exception:
                 return {"ok": True}
+            
+from datetime import datetime, timezone
+
+def _parse_rc_expires_at(expires_str: str | None):
+    """
+    Convert RevenueCat ISO8601 expiry string into UTC ISO string.
+    Returns None if missing or invalid.
+    """
+    if not expires_str:
+        return None
+
+    try:
+        # Convert trailing Z → +00:00 for Python
+        if expires_str.endswith("Z"):
+            expires_str = expires_str[:-1] + "+00:00"
+
+        dt = datetime.fromisoformat(expires_str)
+
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+
+        return dt.astimezone(timezone.utc).isoformat()
+    except Exception:
+        return None
+
+def rc_get_subscriber(app_user_id: str) -> dict:
+    """
+    Calls RevenueCat API v1 to fetch subscriber status.
+    Auth is via Authorization header with API key:contentReference[oaicite:11]{index=11}.
+    """
+    if not requests:
+        raise HTTPException(status_code=500, detail="requests library not available on server.")
+    if not REVENUECAT_SECRET_API_KEY_V1:
+        raise HTTPException(status_code=500, detail="REVENUECAT_SECRET_API_KEY_V1 is not set on the server.")
+
+    url = f"https://api.revenuecat.com/v1/subscribers/{app_user_id}"
+    headers = {
+        "Authorization": f"Bearer {REVENUECAT_SECRET_API_KEY_V1}",
+        "Content-Type": "application/json",
+    }
+    r = requests.get(url, headers=headers, timeout=15)
+    if not r.ok:
+        raise HTTPException(status_code=502, detail=f"RevenueCat API failed: {r.status_code} {r.text}")
+    return r.json()
+
+def rc_entitlement_status(subscriber_payload: dict) -> tuple[bool, str | None]:
+    """
+    Returns (is_active, expires_at_iso).
+    RevenueCat returns entitlements in subscriber payload.
+    """
+    sub = (subscriber_payload or {}).get("subscriber") or {}
+    ents = sub.get("entitlements") or {}
+    ent = ents.get(REVENUECAT_ENTITLEMENT_ID) or {}
+    expires_at = _parse_rc_expires_at(ent.get("expires_date") or "")
+    is_active = bool(ent.get("active"))
+    return is_active, expires_at
+
+def upsert_profile_subscription(user_id: str, is_subscribed: bool, expires_at_iso: str | None, rc_app_user_id: str | None = None):
+    """
+    Stores subscription state in Supabase profiles.
+    Assumes you already created the columns in Step 2.
+    """
+    payload = [{
+        "id": user_id,
+        "is_subscribed": bool(is_subscribed),
+        "subscription_expires_at": expires_at_iso,
+        "rc_app_user_id": (rc_app_user_id or user_id),
+        "subscription_source": "revenuecat",
+        "subscription_updated_at": datetime.now(timezone.utc).isoformat(),
+    }]
+    sb_upsert("profiles", payload, on_conflict="id")
+
 
 
 # =========================
@@ -1181,6 +1315,24 @@ def create_session(req: CreateSessionRequest, request: Request):
     # TEMP bridge until real auth exists:
     # Later you will derive user_id from a verified JWT.
     user_id = (request.headers.get("X-User-Id") or "").strip() or None
+    
+    # ---- Subscription gate (paid only) ----
+    if user_id:
+        rows = sb_get(
+            "profiles",
+            {
+                "select": "is_subscribed,subscription_expires_at",
+                "id": f"eq.{user_id}",
+                "limit": "1",
+            },
+        )
+
+        row = rows[0] if isinstance(rows, list) and rows else {}
+
+        if not bool(row.get("is_subscribed")):
+            # 402 = Payment Required
+            raise HTTPException(status_code=402, detail="Subscription required")
+
 
     with db() as conn:
         if req.reset_old_session_id:
@@ -1368,6 +1520,17 @@ def admin_ai_history(session_id: str, x_admin_key: str = Header(default="", alia
 def chat(req: ChatRequest):
     with db() as conn:
         sess = get_session(conn, req.session_id)
+                # ---- Subscription gate (paid only) ----
+        # If session is tied to a user, enforce subscription.
+        user_id = (sess.get("user_id") or "").strip()
+        if user_id:
+            rows = sb_get(
+                "profiles",
+                {"select": "is_pro,pro_expires_at", "user_id": f"eq.{user_id}", "limit": "1"},
+            )
+            row = (rows or [{}])[0] if isinstance(rows, list) and rows else {}
+            if not bool(row.get("is_pro")):
+                raise HTTPException(status_code=402, detail="Subscription required")
 
         year = req.airstream_year or sess.get("airstream_year")
         category = sess.get("category")
