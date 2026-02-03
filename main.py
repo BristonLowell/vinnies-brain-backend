@@ -11,6 +11,9 @@ from collections import deque, defaultdict
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+import smtplib
+from email.message import EmailMessage
+
 
 import psycopg
 from psycopg.rows import dict_row
@@ -201,7 +204,44 @@ SUPPORT_OPEN_HOUR = int(os.getenv("SUPPORT_OPEN_HOUR", "8"))   # 8am
 SUPPORT_CLOSE_HOUR = int(os.getenv("SUPPORT_CLOSE_HOUR", "17"))  # 5pm
 # 0=Mon ... 6=Sun
 SUPPORT_DAYS_OPEN = os.getenv("SUPPORT_DAYS_OPEN", "0,1,2,3,4")  # Mon–Fri
-SUPPORT_EMAIL_TO = os.getenv("SUPPORT_EMAIL_TO", "info@vinnies.net")
+SUPPORT_EMAIL_TO = os.getenv("ESCALATION_EMAIL") or os.getenv("SUPPORT_EMAIL_TO", "BristonLowell@gmail.com")
+
+# Gmail SMTP (optional). If configured, the server will send escalation emails automatically.
+GMAIL_SMTP_USER = os.getenv("GMAIL_SMTP_USER", "").strip()
+GMAIL_SMTP_APP_PASSWORD = os.getenv("GMAIL_SMTP_APP_PASSWORD", "").strip()
+
+def send_escalation_email(to_email: str, subject: str, body: str) -> bool:
+    """Best-effort Gmail SMTP send.
+
+    Returns True if sent, False otherwise. This is intentionally non-blocking for
+    customer UX: failures are logged and the API still returns success.
+    """
+    if not to_email:
+        return False
+    if not GMAIL_SMTP_USER or not GMAIL_SMTP_APP_PASSWORD:
+        return False
+
+    msg = EmailMessage()
+    msg["From"] = GMAIL_SMTP_USER
+    msg["To"] = to_email
+    msg["Subject"] = subject
+    msg.set_content(body)
+
+    try:
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=15) as server:
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
+            server.login(GMAIL_SMTP_USER, GMAIL_SMTP_APP_PASSWORD)
+            server.send_message(msg)
+        return True
+    except Exception as e:
+        try:
+            print(f"SMTP send failed: {e}")
+        except Exception:
+            pass
+        return False
+
 
 @app.post("/v1/billing/revenuecat/webhook")
 async def revenuecat_webhook(request: Request, authorization: str = Header(default="", alias="Authorization")):
@@ -562,6 +602,9 @@ class EscalationResponse(BaseModel):
     email_to: Optional[str] = None
     email_subject: Optional[str] = None
     email_body: Optional[str] = None
+
+    # True if the server successfully emailed the escalation (requires Gmail SMTP env vars)
+    emailed: Optional[bool] = None
 
 
 
@@ -1878,6 +1921,8 @@ def create_escalation(req: EscalationRequest):
         + (req.message or "")
     ).strip()
 
+    emailed = send_escalation_email(SUPPORT_EMAIL_TO, email_subject, email_body)
+
     return {
         "ticket_id": ticket_id,
         "escalation_id": ticket_id,
@@ -1887,6 +1932,7 @@ def create_escalation(req: EscalationRequest):
         "email_to": SUPPORT_EMAIL_TO,
         "email_subject": email_subject,
         "email_body": email_body,
+        "emailed": emailed,
     }
 
 
