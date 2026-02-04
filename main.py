@@ -157,37 +157,27 @@ async def request_id_and_rate_limit(request: Request, call_next):
 def db():
     """Get a DB connection from the pool.
 
-    Render/Supabase can occasionally drop idle connections. If that happens mid-request,
-    we retry once with a fresh connection so transient disconnects don't 500 the app.
+    Notes:
+    - Keep this context manager single-yield (no retry loops) to avoid
+      `RuntimeError: generator didn't stop after throw()` when exceptions occur.
+    - We defensively rollback on exit so pooled connections don't come back INTRANS.
     """
-    last_exc = None
-    for attempt in range(2):
-        conn = DB_POOL.getconn()
+    conn = DB_POOL.getconn()
+    try:
+        conn.row_factory = dict_row
+        yield conn
+    except Exception:
         try:
-            conn.row_factory = dict_row
-            yield conn
-            return
-        except psycopg.OperationalError as e:
-            last_exc = e
-            try:
-                logger.warning("DB OperationalError (attempt %s/2). Retrying with a fresh connection.", attempt + 1)
-            except Exception:
-                pass
-            try:
-                conn.close()
-            except Exception:
-                pass
-            if attempt == 0:
-                continue
-            raise
-        finally:
-            try:
-                DB_POOL.putconn(conn)
-            except Exception:
-                pass
-    # Should never reach here, but in case:
-    if last_exc:
-        raise last_exc
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        DB_POOL.putconn(conn)
 
 # -------------------------
 # Telemetry (optional)
