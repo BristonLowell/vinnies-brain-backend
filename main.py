@@ -14,7 +14,6 @@ from zoneinfo import ZoneInfo
 import smtplib
 from email.message import EmailMessage
 
-
 import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
@@ -50,6 +49,9 @@ REVENUECAT_WEBHOOK_AUTH = os.getenv("REVENUECAT_WEBHOOK_AUTH", "").strip()
 REVENUECAT_SECRET_API_KEY_V1 = os.getenv("REVENUECAT_SECRET_API_KEY_V1", "").strip()
 REVENUECAT_ENTITLEMENT_ID = os.getenv("REVENUECAT_ENTITLEMENT_ID", "Vinnies Brain Pro").strip()
 
+# Toggle for gating paid subscription checks.
+# Set SUBSCRIPTION_GATE_ENABLED=0 to disable (recommended while wiring up Android / profiles).
+SUBSCRIPTION_GATE_ENABLED = os.getenv("SUBSCRIPTION_GATE_ENABLED", "0").strip() == "1"
 
 # =========================
 # App + DB helpers
@@ -158,6 +160,7 @@ def db():
     finally:
         DB_POOL.putconn(conn)
 
+
 # -------------------------
 # Telemetry (optional)
 # -------------------------
@@ -172,7 +175,6 @@ def _telemetry_insert(conn, session_id: str, event_type: str, payload: Optional[
         )
     except Exception:
         return
-
 
 
 def exec_one(conn, sql: str, params: Tuple = ()):
@@ -195,12 +197,13 @@ def exec_no_return(conn, sql: str, params: Tuple = ()):
 def clamp01(x: float) -> float:
     return max(0.0, min(1.0, float(x)))
 
+
 # =========================
 # Support routing helpers
 # =========================
 # Business hours are evaluated server-side in Pacific Time so iOS/Android behave identically.
 SUPPORT_TZ = os.getenv("SUPPORT_TZ", "America/Los_Angeles")
-SUPPORT_OPEN_HOUR = int(os.getenv("SUPPORT_OPEN_HOUR", "8"))   # 8am
+SUPPORT_OPEN_HOUR = int(os.getenv("SUPPORT_OPEN_HOUR", "8"))  # 8am
 SUPPORT_CLOSE_HOUR = int(os.getenv("SUPPORT_CLOSE_HOUR", "17"))  # 5pm
 # 0=Mon ... 6=Sun
 SUPPORT_DAYS_OPEN = os.getenv("SUPPORT_DAYS_OPEN", "0,1,2,3,4")  # Mon–Fri
@@ -209,6 +212,7 @@ SUPPORT_EMAIL_TO = os.getenv("ESCALATION_EMAIL") or os.getenv("SUPPORT_EMAIL_TO"
 # Gmail SMTP (optional). If configured, the server will send escalation emails automatically.
 GMAIL_SMTP_USER = os.getenv("GMAIL_SMTP_USER", "").strip()
 GMAIL_SMTP_APP_PASSWORD = os.getenv("GMAIL_SMTP_APP_PASSWORD", "").strip()
+
 
 def send_escalation_email(to_email: str, subject: str, body: str) -> bool:
     """Best-effort Gmail SMTP send.
@@ -247,7 +251,7 @@ def send_escalation_email(to_email: str, subject: str, body: str) -> bool:
 async def revenuecat_webhook(request: Request, authorization: str = Header(default="", alias="Authorization")):
     """
     RevenueCat recommends setting an Authorization header value in their dashboard
-    and validating it in your server:contentReference[oaicite:12]{index=12}.
+    and validating it in your server.
     """
     if not REVENUECAT_WEBHOOK_AUTH:
         raise HTTPException(status_code=500, detail="REVENUECAT_WEBHOOK_AUTH is not set on the server.")
@@ -282,20 +286,22 @@ async def revenuecat_webhook(request: Request, authorization: str = Header(defau
 def billing_status(request: Request):
     """
     App can call this to quickly learn if the current user is subscribed.
-    Uses your existing temporary auth bridge: X-User-Id:contentReference[oaicite:13]{index=13}.
+    Uses your existing temporary auth bridge: X-User-Id.
     """
     user_id = (request.headers.get("X-User-Id") or "").strip()
     if not user_id:
         raise HTTPException(status_code=401, detail="Not authenticated (missing X-User-Id)")
 
-    rows = sb_get("profiles", {"select": "id,is_subscribed,subscription_expires_at,rc_app_user_id", "id": f"eq.{user_id}", "limit": "1"})
+    rows = sb_get(
+        "profiles",
+        {"select": "id,is_subscribed,subscription_expires_at,rc_app_user_id", "id": f"eq.{user_id}", "limit": "1"},
+    )
     row = (rows or [{}])[0] if isinstance(rows, list) and rows else {}
     return {
-    "user_id": user_id,
-    "is_subscribed": bool(row.get("is_subscribed")),
-    "subscription_expires_at": row.get("subscription_expires_at"),
-}
-
+        "user_id": user_id,
+        "is_subscribed": bool(row.get("is_subscribed")),
+        "subscription_expires_at": row.get("subscription_expires_at"),
+    }
 
 
 def _pt_now() -> datetime:
@@ -343,7 +349,7 @@ def build_escalation_email_subject(session_id: str) -> str:
     return f"Vinnies Brain Escalation — Session {session_id}"
 
 
-def build_escalation_email_body(*, req: 'EscalationRequest', transcript: str, business_hours: bool) -> str:
+def build_escalation_email_body(*, req: "EscalationRequest", transcript: str, business_hours: bool) -> str:
     lines: List[str] = []
     lines.append("Vinnies Brain — Escalation")
     lines.append("")
@@ -364,6 +370,7 @@ def build_escalation_email_body(*, req: 'EscalationRequest', transcript: str, bu
     lines.append("AI troubleshooting transcript")
     lines.append(transcript or "(no transcript found)")
     return "\n".join(lines).strip()
+
 
 # =========================
 # Supabase REST helpers
@@ -459,8 +466,10 @@ def sb_delete(table: str, params: Dict[str, str], prefer: str = "return=minimal"
                 return json.loads(raw)
             except Exception:
                 return {"ok": True}
-            
+
+
 from datetime import datetime, timezone
+
 
 def _parse_rc_expires_at(expires_str: str | None):
     """
@@ -484,11 +493,11 @@ def _parse_rc_expires_at(expires_str: str | None):
     except Exception:
         return None
 
+
 def rc_get_subscriber(app_user_id: str) -> dict:
     """
     Calls RevenueCat API v1 to fetch subscriber status.
     Auth is via Authorization: Bearer <secret_api_key>.
-
     """
     if not requests:
         raise HTTPException(status_code=500, detail="requests library not available on server.")
@@ -505,6 +514,7 @@ def rc_get_subscriber(app_user_id: str) -> dict:
         raise HTTPException(status_code=502, detail=f"RevenueCat API failed: {r.status_code} {r.text}")
     return r.json()
 
+
 def rc_entitlement_status(subscriber_payload: dict) -> tuple[bool, str | None]:
     """
     Returns (is_active, expires_at_iso).
@@ -517,21 +527,56 @@ def rc_entitlement_status(subscriber_payload: dict) -> tuple[bool, str | None]:
     is_active = bool(ent.get("active"))
     return is_active, expires_at
 
-def upsert_profile_subscription(user_id: str, is_subscribed: bool, expires_at_iso: str | None, rc_app_user_id: str | None = None):
+
+def upsert_profile_subscription(
+    user_id: str,
+    is_subscribed: bool,
+    expires_at_iso: str | None,
+    rc_app_user_id: str | None = None,
+):
     """
     Stores subscription state in Supabase profiles.
     Assumes you already created the columns in Step 2.
     """
-    payload = [{
-        "id": user_id,
-        "is_subscribed": bool(is_subscribed),
-        "subscription_expires_at": expires_at_iso,
-        "rc_app_user_id": (rc_app_user_id or user_id),
-        "subscription_source": "revenuecat",
-        "subscription_updated_at": datetime.now(timezone.utc).isoformat(),
-    }]
+    payload = [
+        {
+            "id": user_id,
+            "is_subscribed": bool(is_subscribed),
+            "subscription_expires_at": expires_at_iso,
+            "rc_app_user_id": (rc_app_user_id or user_id),
+            "subscription_source": "revenuecat",
+            "subscription_updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+    ]
     sb_upsert("profiles", payload, on_conflict="id")
 
+
+# =========================
+# Subscription enforcement helper (NEW)
+# =========================
+def enforce_subscription_if_enabled(user_id: str) -> None:
+    """
+    Enforces paid subscription only when SUBSCRIPTION_GATE_ENABLED=1.
+    Uses profiles.id + is_subscribed/subscription_expires_at (your newer naming).
+    """
+    if not SUBSCRIPTION_GATE_ENABLED:
+        return
+
+    uid = (user_id or "").strip()
+    if not uid:
+        return
+
+    rows = sb_get(
+        "profiles",
+        {
+            "select": "is_subscribed,subscription_expires_at",
+            "id": f"eq.{uid}",
+            "limit": "1",
+        },
+    )
+    row = rows[0] if isinstance(rows, list) and rows else {}
+    if not bool(row.get("is_subscribed")):
+        raise HTTPException(status_code=402, detail="Subscription required")
 
 
 # =========================
@@ -591,6 +636,7 @@ class EscalationRequest(BaseModel):
     preferred_contact: Optional[str] = "text"
     reset_old: bool = False
 
+
 class EscalationResponse(BaseModel):
     ticket_id: str
     escalation_id: Optional[str] = None
@@ -606,7 +652,6 @@ class EscalationResponse(BaseModel):
 
     # True if the server successfully emailed the escalation (requires Gmail SMTP env vars)
     emailed: Optional[bool] = None
-
 
 
 class LiveChatSendRequest(BaseModel):
@@ -867,6 +912,7 @@ def get_recent_messages(conn, session_id: str, limit: int = 200):
         (session_id, limit),
     )
 
+
 def format_transcript(messages: List[Dict[str, Any]], max_chars: int = 9000) -> str:
     """Human-readable transcript for escalation emails. Trims to keep mailto links usable."""
     lines: List[str] = []
@@ -885,7 +931,6 @@ def format_transcript(messages: List[Dict[str, Any]], max_chars: int = 9000) -> 
     # Keep the tail (most recent context tends to matter most)
     tail = out[-max_chars:]
     return "(transcript trimmed)\n...\n" + tail
-
 
 
 # =========================
@@ -1334,6 +1379,7 @@ def _shutdown():
 def health():
     return {"ok": True, "service": "vinnies-brain-backend"}
 
+
 @app.get("/v1/support/status")
 def support_status():
     """Lets the mobile app decide whether to show Live Chat vs Email options."""
@@ -1359,24 +1405,10 @@ def create_session(req: CreateSessionRequest, request: Request):
     # TEMP bridge until real auth exists:
     # Later you will derive user_id from a verified JWT.
     user_id = (request.headers.get("X-User-Id") or "").strip() or None
-    
-    # ---- Subscription gate (paid only) ----
+
+    # ✅ Subscription gate (unified + optional)
     if user_id:
-        rows = sb_get(
-            "profiles",
-            {
-                "select": "is_subscribed,subscription_expires_at",
-                "id": f"eq.{user_id}",
-                "limit": "1",
-            },
-        )
-
-        row = rows[0] if isinstance(rows, list) and rows else {}
-
-        if not bool(row.get("is_subscribed")):
-            # 402 = Payment Required
-            raise HTTPException(status_code=402, detail="Subscription required")
-
+        enforce_subscription_if_enabled(user_id)
 
     with db() as conn:
         if req.reset_old_session_id:
@@ -1484,6 +1516,7 @@ def session_exists(session_id: str):
             raise HTTPException(status_code=404, detail="Session not found")
         return {"ok": True}
 
+
 @app.get("/v1/sessions/{session_id}/history")
 def session_history(session_id: str):
     """Customer-safe transcript endpoint (used to prefill an escalation email)."""
@@ -1564,17 +1597,11 @@ def admin_ai_history(session_id: str, x_admin_key: str = Header(default="", alia
 def chat(req: ChatRequest):
     with db() as conn:
         sess = get_session(conn, req.session_id)
-                # ---- Subscription gate (paid only) ----
-        # If session is tied to a user, enforce subscription.
+
+        # ✅ Subscription gate (unified + optional)
         user_id = (sess.get("user_id") or "").strip()
         if user_id:
-            rows = sb_get(
-                "profiles",
-                {"select": "is_pro,pro_expires_at", "user_id": f"eq.{user_id}", "limit": "1"},
-            )
-            row = (rows or [{}])[0] if isinstance(rows, list) and rows else {}
-            if not bool(row.get("is_pro")):
-                raise HTTPException(status_code=402, detail="Subscription required")
+            enforce_subscription_if_enabled(user_id)
 
         year = req.airstream_year or sess.get("airstream_year")
         category = sess.get("category")
@@ -1746,7 +1773,7 @@ def chat(req: ChatRequest):
             history=history,
         )
 
-        # Checkpoint summary (every ~6 assistant messages): helps users + admins see progress.
+        # Checkpoint summary (every ~3 assistant messages)
         checkpoint_summary = None
         try:
             assistant_count = sum(
@@ -1754,7 +1781,7 @@ def chat(req: ChatRequest):
                 for h in (history or [])
                 if (h.get("role") or "").strip().lower() == "assistant"
             )
-            # Generate on the 6th, 12th, 18th... assistant response
+            # Generate on the 3rd, 6th, 9th...
             if (assistant_count + 1) % 3 == 0:
                 checkpoint_summary = generate_checkpoint_summary(
                     history=history,
@@ -1764,7 +1791,7 @@ def chat(req: ChatRequest):
         except Exception:
             checkpoint_summary = None
 
-# If the AI asked a clarifying question, store it as active_question_text
+        # If the AI asked a clarifying question, store it as active_question_text
         if aq_supported:
             q_to_store = (clarifying[0] if (isinstance(clarifying, list) and len(clarifying) > 0) else "").strip()
             exec_no_return(
@@ -1792,7 +1819,6 @@ def chat(req: ChatRequest):
             show_escalation=True,
             message_id=message_id,
         )
-
 
 
 @app.post("/v1/escalations", response_model=EscalationResponse)
@@ -1915,8 +1941,8 @@ def create_escalation(req: EscalationRequest):
         f"Business hours at submit: {'YES' if open_now else 'NO'}\n\n"
         "Customer info\n"
         f"Name: {req.name}\n"
-        + (f"Email: {req.email}\n" if (req.email or '').strip() else "")
-        + (f"Phone: {req.phone}\n" if (req.phone or '').strip() else "")
+        + (f"Email: {req.email}\n" if (req.email or "").strip() else "")
+        + (f"Phone: {req.phone}\n" if (req.phone or "").strip() else "")
         + f"Preferred contact: {req.preferred_contact}\n\n"
         "Issue summary\n"
         + (req.message or "")
@@ -1993,7 +2019,6 @@ def admin_create_article(req: AdminArticleRequest, x_admin_key: str = Header(def
             raise HTTPException(status_code=500, detail=f"Failed to create article: {e}")
 
 
-
 @app.get("/v1/admin/escalations")
 def admin_list_escalations(
     status: str = "",
@@ -2031,8 +2056,6 @@ def admin_list_escalations(
     return {"escalations": out}
 
 
-
-
 class AdminUpdateEscalationRequest(BaseModel):
     status: Optional[str] = None  # open | in_progress | closed
 
@@ -2053,7 +2076,6 @@ def admin_update_escalation(
 
     _ = sb_upsert("escalations", [payload], on_conflict="id")
     return {"ok": True}
-
 
 
 @app.get("/v1/admin/livechat/conversations")
@@ -2191,5 +2213,3 @@ def admin_delete_livechat_conversation(conversation_id: str, x_admin_key: str = 
     _ = sb_delete("conversations", {"id": f"eq.{conversation_id}"}, prefer="return=minimal")
 
     return {"ok": True}
-
-
