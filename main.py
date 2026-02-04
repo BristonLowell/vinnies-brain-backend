@@ -151,14 +151,55 @@ async def request_id_and_rate_limit(request: Request, call_next):
     return resp
 
 
+# =========================
+# DB context (FIXED)
+# - retries once if pool hands a dead connection
+# - always rollback before returning to pool (prevents INTRANS reuse)
+# =========================
 @contextmanager
 def db():
-    conn = DB_POOL.getconn()
+    conn = None
     try:
-        conn.row_factory = dict_row
+        for attempt in range(2):
+            conn = DB_POOL.getconn()
+            try:
+                conn.row_factory = dict_row
+                # probe: catches dead sockets early
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                break
+            except psycopg.OperationalError:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                try:
+                    DB_POOL.putconn(conn)
+                except Exception:
+                    pass
+                conn = None
+                if attempt == 1:
+                    raise
+
+        if conn is None:
+            raise psycopg.OperationalError("Failed to acquire a healthy DB connection")
+
         yield conn
+
     finally:
-        DB_POOL.putconn(conn)
+        if conn is not None:
+            # ALWAYS rollback before returning to pool (prevents INTRANS warnings)
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            try:
+                DB_POOL.putconn(conn)
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
 
 # -------------------------
@@ -861,17 +902,22 @@ def require_admin(x_admin_key: str) -> None:
 _SESS_COLUMNS_CACHE: Optional[set] = None
 
 
+# FIXED: make this resilient to transient connection drops
 def _get_sessions_columns(conn) -> set:
     global _SESS_COLUMNS_CACHE
     if _SESS_COLUMNS_CACHE is not None:
         return _SESS_COLUMNS_CACHE
-    rows = exec_all(
-        conn,
-        "SELECT column_name FROM information_schema.columns WHERE table_name='sessions'",
-        (),
-    )
-    _SESS_COLUMNS_CACHE = {r["column_name"] for r in (rows or []) if r.get("column_name")}
-    return _SESS_COLUMNS_CACHE
+    try:
+        rows = exec_all(
+            conn,
+            "SELECT column_name FROM information_schema.columns WHERE table_name='sessions'",
+            (),
+        )
+        _SESS_COLUMNS_CACHE = {r["column_name"] for r in (rows or []) if r.get("column_name")}
+        return _SESS_COLUMNS_CACHE
+    except psycopg.OperationalError:
+        # If the connection died mid-query, don't take down /v1/sessions; just act like columns are unknown.
+        return set()
 
 
 def sessions_supports_pinning(conn) -> bool:
@@ -1361,6 +1407,11 @@ def ensure_escalations_table(conn):
 def _startup():
     with db() as conn:
         ensure_escalations_table(conn)
+        # warm cache so first request doesn't hit information_schema under load
+        try:
+            _get_sessions_columns(conn)
+        except Exception:
+            pass
         conn.commit()
 
 
@@ -2094,7 +2145,11 @@ def admin_livechat_conversations(x_admin_key: str = Header(default="", alias="X-
         cid = r.get("conversation_id")
         if not cid or cid in last_by_conv:
             continue
-        last_by_conv[cid] = {"sender_role": r.get("sender_role"), "body": r.get("body"), "created_at": r.get("created_at")}
+        last_by_conv[cid] = {
+            "sender_role": r.get("sender_role"),
+            "body": r.get("body"),
+            "created_at": r.get("created_at"),
+        }
         conv_ids.append(cid)
         if len(conv_ids) >= 50:
             break
@@ -2108,7 +2163,9 @@ def admin_livechat_conversations(x_admin_key: str = Header(default="", alias="X-
     conversations: List[Dict[str, Any]] = []
     for cid in conv_ids:
         c = by_id.get(cid) or {}
-        conversations.append({"conversation_id": cid, "customer_id": c.get("customer_id") or "", "last_message": last_by_conv.get(cid)})
+        conversations.append(
+            {"conversation_id": cid, "customer_id": c.get("customer_id") or "", "last_message": last_by_conv.get(cid)}
+        )
 
     return {"conversations": conversations}
 
