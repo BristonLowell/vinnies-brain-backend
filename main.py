@@ -50,6 +50,10 @@ REVENUECAT_WEBHOOK_AUTH = os.getenv("REVENUECAT_WEBHOOK_AUTH", "").strip()
 REVENUECAT_SECRET_API_KEY_V1 = os.getenv("REVENUECAT_SECRET_API_KEY_V1", "").strip()
 REVENUECAT_ENTITLEMENT_ID = os.getenv("REVENUECAT_ENTITLEMENT_ID", "Vinnies Brain Pro").strip()
 
+# Toggle for gating paid subscription checks.
+# Set SUBSCRIPTION_GATE_ENABLED=0 to disable (recommended while wiring up Android / profiles).
+SUBSCRIPTION_GATE_ENABLED = os.getenv("SUBSCRIPTION_GATE_ENABLED", "0").strip() == "1"
+
 
 # =========================
 # App + DB helpers
@@ -558,6 +562,35 @@ def upsert_profile_subscription(user_id: str, is_subscribed: bool, expires_at_is
         "subscription_updated_at": datetime.now(timezone.utc).isoformat(),
     }]
     sb_upsert("profiles", payload, on_conflict="id")
+
+
+
+# =========================
+# Subscription enforcement helper (NEW)
+# =========================
+def enforce_subscription_if_enabled(user_id: str) -> None:
+    """Enforce paid subscription only when SUBSCRIPTION_GATE_ENABLED=1.
+
+    Uses profiles.id + is_subscribed/subscription_expires_at.
+    """
+    if not SUBSCRIPTION_GATE_ENABLED:
+        return
+
+    uid = str(user_id or "").strip()
+    if not uid:
+        return
+
+    rows = sb_get(
+        "profiles",
+        {
+            "select": "is_subscribed,subscription_expires_at",
+            "id": f"eq.{uid}",
+            "limit": "1",
+        },
+    )
+    row = rows[0] if isinstance(rows, list) and rows else {}
+    if not bool(row.get("is_subscribed")):
+        raise HTTPException(status_code=402, detail="Subscription required")
 
 
 
@@ -1386,24 +1419,10 @@ def create_session(req: CreateSessionRequest, request: Request):
     # TEMP bridge until real auth exists:
     # Later you will derive user_id from a verified JWT.
     user_id = (request.headers.get("X-User-Id") or "").strip() or None
-    
-    # ---- Subscription gate (paid only) ----
+
+    # ✅ Subscription gate (optional)
     if user_id:
-        rows = sb_get(
-            "profiles",
-            {
-                "select": "is_subscribed,subscription_expires_at",
-                "id": f"eq.{user_id}",
-                "limit": "1",
-            },
-        )
-
-        row = rows[0] if isinstance(rows, list) and rows else {}
-
-        if not bool(row.get("is_subscribed")):
-            # 402 = Payment Required
-            raise HTTPException(status_code=402, detail="Subscription required")
-
+        enforce_subscription_if_enabled(user_id)
 
     with db() as conn:
         if req.reset_old_session_id:
@@ -1591,18 +1610,11 @@ def admin_ai_history(session_id: str, x_admin_key: str = Header(default="", alia
 def chat(req: ChatRequest):
     with db() as conn:
         sess = get_session(conn, req.session_id)
-                # ---- Subscription gate (paid only) ----
-        # If session is tied to a user, enforce subscription.
-        _uid = sess.get("user_id")
-        user_id = (str(_uid) if _uid is not None else "").strip()
+                        # ✅ Subscription gate (optional)
+        user_id = str(sess.get("user_id") or "").strip()
         if user_id:
-            rows = sb_get(
-                "profiles",
-                {"select": "is_pro,pro_expires_at", "user_id": f"eq.{user_id}", "limit": "1"},
-            )
-            row = (rows or [{}])[0] if isinstance(rows, list) and rows else {}
-            if not bool(row.get("is_pro")):
-                raise HTTPException(status_code=402, detail="Subscription required")
+            enforce_subscription_if_enabled(user_id)
+
 
         year = req.airstream_year or sess.get("airstream_year")
         category = sess.get("category")
