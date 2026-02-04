@@ -48,7 +48,7 @@ ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", os.getenv("ADMIN_KEY", "")).strip()
 # =========================
 REVENUECAT_WEBHOOK_AUTH = os.getenv("REVENUECAT_WEBHOOK_AUTH", "").strip()
 REVENUECAT_SECRET_API_KEY_V1 = os.getenv("REVENUECAT_SECRET_API_KEY_V1", "").strip()
-REVENUECAT_ENTITLEMENT_ID = os.getenv("REVENUECAT_ENTITLEMENT_ID", "pro").strip()
+REVENUECAT_ENTITLEMENT_ID = os.getenv("REVENUECAT_ENTITLEMENT_ID", "Vinnies Brain Pro").strip()
 
 
 # =========================
@@ -487,7 +487,8 @@ def _parse_rc_expires_at(expires_str: str | None):
 def rc_get_subscriber(app_user_id: str) -> dict:
     """
     Calls RevenueCat API v1 to fetch subscriber status.
-    Auth is via Authorization header with API key:contentReference[oaicite:11]{index=11}.
+    Auth is via Authorization: Bearer <secret_api_key>.
+
     """
     if not requests:
         raise HTTPException(status_code=500, detail="requests library not available on server.")
