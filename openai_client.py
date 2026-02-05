@@ -154,6 +154,7 @@ def generate_answer(
     airstream_year: Optional[int] = None,
     category: Optional[str] = None,
     history: Optional[List[Dict[str, Any]]] = None,
+    pending_question: Optional[str] = None,
 ) -> Tuple[str, List[str], float]:
     """
     Matches what main.py expects:
@@ -174,6 +175,10 @@ When refusing:
 - Invite the user to ask an Airstream-specific question
 - Do NOT provide general advice or an off-topic answer
 - Still return valid JSON in the required schema
+
+CONTEXT ANCHOR (reduce confusion on short replies):
+- If the input includes a PENDING_QUESTION, treat the user's message as answering it.
+- Stay on that diagnostic thread; do not switch topics unless the user explicitly asks to reset/switch.
 
 CRITICAL FORMAT RULE (UI requirement):
 - NEVER put the clarifying question in the "answer" text (especially not bold at the top).
@@ -234,12 +239,32 @@ Return STRICT JSON:
     hist_block = transcript
 
     user_block_parts: List[str] = []
+
     if kb_block:
         user_block_parts.append("KNOWLEDGE BASE CONTEXT:\n" + kb_block)
+
     if hist_block:
         user_block_parts.append("RECENT CHAT HISTORY:\n" + hist_block)
-    user_block_parts.append("USER MESSAGE:\n" + (user_message or "").strip())
+
+    # 🔒 STEP C — anchor the user's reply to the last clarifying question
+    pending_q = (pending_question or "").strip()
+    if pending_q:
+        # defensively remove markdown wrappers if they slipped in
+        if pending_q.startswith("**") and pending_q.endswith("**") and len(pending_q) > 4:
+            pending_q = pending_q[2:-2].strip()
+
+        user_block_parts.append(
+            "PENDING CLARIFYING QUESTION (the user is answering this now):\n"
+            + pending_q
+        )
+
+    # USER MESSAGE ALWAYS COMES LAST
+    user_block_parts.append(
+        "USER MESSAGE:\n" + (user_message or "").strip()
+    )
+
     full_input = "\n\n---\n\n".join(user_block_parts)
+
 
     resp = client.responses.create(
         model=CHAT_MODEL,

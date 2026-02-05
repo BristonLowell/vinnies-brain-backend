@@ -1109,11 +1109,39 @@ def should_reset_flow(message: str) -> bool:
 
 
 def rewrite_short_answer(user_text: str, active_question_text: Optional[str]) -> str:
-    yn = normalize_yes_no(user_text)
+    """Rewrite very short replies so the model reliably anchors them to the last asked question.
+
+    This is a pragmatic fix for "yes", "no", "only while driving", "sometimes", etc. where
+    the user is clearly replying to the AI's most recent question.
+    """
     q = (active_question_text or "").strip()
-    if yn and q:
+    if not q:
+        return user_text
+
+    # Strip markdown bold wrapper if UI stored it that way.
+    if q.startswith("**") and q.endswith("**") and len(q) > 4:
+        q = q[2:-2].strip()
+
+    # If user is explicitly switching/resetting, do not anchor.
+    if should_reset_flow(user_text):
+        return user_text
+
+    # If user is asking a new question (has '?') we also don't force-anchor.
+    if "?" in (user_text or ""):
+        return user_text
+
+    yn = normalize_yes_no(user_text)
+    if yn:
         return f'Answer to: "{q}" -> {yn}'
+
+    # Anchor other short/ambiguous replies.
+    compact = (user_text or "").strip()
+    word_count = len(compact.split())
+    if len(compact) <= 28 or word_count <= 4:
+        return f'User is answering the previous question: "{q}". User reply: {compact}'
+
     return user_text
+
 
 
 # =========================
@@ -1755,6 +1783,11 @@ def chat(req: ChatRequest):
 
         history = get_recent_messages(conn, req.session_id, limit=50)
 
+        # Step B: compute pending_q from the last stored assistant question
+        pending_q = (active_question_text or "").strip()
+        if pending_q.startswith("**") and pending_q.endswith("**") and len(pending_q) > 4:
+            pending_q = pending_q[2:-2].strip()
+
         try:
             answer, clarifying, confidence = generate_answer(
                 user_message=rewritten_user_message,
@@ -1763,9 +1796,11 @@ def chat(req: ChatRequest):
                 airstream_year=year,
                 category=category,
                 history=history,
+                pending_question=pending_q or None,   # ✅ add this line
             )
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"LLM error: {e}")
+
 
         # Subtle check-in (NEW): occasionally append a gentle “let me know what happened after trying that”
         answer = maybe_append_subtle_checkin(
@@ -1794,14 +1829,18 @@ def chat(req: ChatRequest):
         except Exception:
             checkpoint_summary = None
 
-# If the AI asked a clarifying question, store it as active_question_text
+# If the AI asked a clarifying question, store it as active_question_text.
+# We store it *without* markdown wrappers so we can reliably anchor the next user reply.
         if aq_supported:
             q_to_store = (clarifying[0] if (isinstance(clarifying, list) and len(clarifying) > 0) else "").strip()
+            if q_to_store.startswith("**") and q_to_store.endswith("**") and len(q_to_store) > 4:
+                q_to_store = q_to_store[2:-2].strip()
             exec_no_return(
                 conn,
                 "UPDATE sessions SET active_question_text=%s WHERE id=%s",
                 (q_to_store or None, req.session_id),
             )
+
 
         message_id = str(uuid.uuid4())
         log_message(conn, req.session_id, "user", req.message)
