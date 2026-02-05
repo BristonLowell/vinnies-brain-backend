@@ -1938,6 +1938,17 @@ def create_escalation(req: EscalationRequest):
             pass
 
     email_subject = build_escalation_email_subject(req.session_id)
+    email_subject = build_escalation_email_subject(req.session_id)
+
+    transcript_block = ""
+    if excerpt and excerpt.strip():
+        transcript_block = (
+            "\n\n"
+            "Conversation transcript (most recent)\n"
+            "------------------------------\n"
+            f"{excerpt.strip()}"
+        )
+
     email_body = (
         "Vinnies Brain — Escalation\n"
         f"Session ID: {req.session_id}\n"
@@ -1949,8 +1960,10 @@ def create_escalation(req: EscalationRequest):
         + (f"Phone: {req.phone}\n" if (req.phone or '').strip() else "")
         + f"Preferred contact: {req.preferred_contact}\n\n"
         "Issue summary\n"
-        + (req.message or "")
+        + (req.message or "").strip()
+        + transcript_block
     ).strip()
+
 
     emailed = send_escalation_email(SUPPORT_EMAIL_TO, email_subject, email_body)
 
