@@ -157,27 +157,70 @@ async def request_id_and_rate_limit(request: Request, call_next):
 def db():
     """Get a DB connection from the pool.
 
-    Notes:
-    - Keep this context manager single-yield (no retry loops) to avoid
-      `RuntimeError: generator didn't stop after throw()` when exceptions occur.
-    - We defensively rollback on exit so pooled connections don't come back INTRANS.
+    Supabase/Postgres can drop idle TCP connections. If we return a dead
+    connection to the pool, the next request can crash with:
+      psycopg.OperationalError: server closed the connection unexpectedly
+
+    So:
+    - If we hit a connection-level OperationalError, we DISCARD the conn.
+    - We rollback best-effort so pooled conns don't come back INTRANS.
     """
+
     conn = DB_POOL.getconn()
+    bad = False
     try:
         conn.row_factory = dict_row
         yield conn
-    except Exception:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
+    except psycopg.OperationalError:
+        bad = True
         raise
     finally:
+        # Rollback best-effort (skip if broken/closed).
         try:
-            conn.rollback()
+            if not bad and getattr(conn, "closed", 0) == 0:
+                conn.rollback()
         except Exception:
             pass
-        DB_POOL.putconn(conn)
+
+        # Return to pool OR discard.
+        try:
+            if bad or getattr(conn, "closed", 0) != 0:
+                # psycopg_pool supports close=True; if not, fallback to conn.close().
+                try:
+                    DB_POOL.putconn(conn, close=True)  # type: ignore[arg-type]
+                except TypeError:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                except Exception:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+            else:
+                DB_POOL.putconn(conn)
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def run_db_transaction(fn, attempts: int = 2):
+    """Run a DB transaction with a small retry for transient disconnects."""
+    last_err = None
+    for i in range(max(1, attempts)):
+        try:
+            with db() as conn:
+                out = fn(conn)
+                conn.commit()
+                return out
+        except psycopg.OperationalError as e:
+            last_err = e
+            logger.warning("DB OperationalError (attempt %s/%s): %s", i + 1, attempts, e)
+            continue
+    raise last_err  # type: ignore[misc]
 
 # -------------------------
 # Telemetry (optional)
@@ -1442,7 +1485,7 @@ def create_session(req: CreateSessionRequest, request: Request):
     if user_id:
         enforce_subscription_if_enabled(user_id)
 
-    with db() as conn:
+    def _tx(conn):
         if req.reset_old_session_id:
             if req.delete_old_messages:
                 exec_no_return(conn, "DELETE FROM chat_messages WHERE session_id=%s", (req.reset_old_session_id,))
@@ -1457,8 +1500,10 @@ def create_session(req: CreateSessionRequest, request: Request):
         else:
             exec_no_return(conn, "INSERT INTO sessions (id, channel, mode) VALUES (%s, %s, %s)", (sid, req.channel, req.mode))
 
-        conn.commit()
-    return {"session_id": sid}
+        return {"session_id": sid}
+
+    # Retry once if Supabase/Postgres dropped the pooled connection.
+    return run_db_transaction(_tx, attempts=2)
 
 
 @app.get("/v1/sessions")
