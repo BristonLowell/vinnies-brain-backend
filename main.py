@@ -601,10 +601,12 @@ def upsert_profile_subscription(user_id: str, is_subscribed: bool, expires_at_is
 # =========================
 # Subscription enforcement helper (NEW)
 # =========================
+from datetime import datetime, timezone
+
 def enforce_subscription_if_enabled(user_id: str) -> None:
     """Enforce paid subscription only when SUBSCRIPTION_GATE_ENABLED=1.
 
-    Uses profiles.id + is_subscribed/subscription_expires_at.
+    Uses profiles.user_id + is_pro + pro_expires_at.
     """
     if not SUBSCRIPTION_GATE_ENABLED:
         return
@@ -616,14 +618,36 @@ def enforce_subscription_if_enabled(user_id: str) -> None:
     rows = sb_get(
         "profiles",
         {
-            "select": "is_subscribed,subscription_expires_at",
-            "id": f"eq.{uid}",
+            "select": "user_id,is_pro,pro_expires_at",
+            "user_id": f"eq.{uid}",   # ✅ correct column
             "limit": "1",
         },
     )
-    row = rows[0] if isinstance(rows, list) and rows else {}
-    if not bool(row.get("is_subscribed")):
+
+    # If the profile row doesn't exist yet, treat as not pro (or you can auto-create)
+    row = rows[0] if isinstance(rows, list) and rows else None
+    if not row:
         raise HTTPException(status_code=402, detail="Subscription required")
+
+    is_pro = bool(row.get("is_pro"))
+
+    # Optional: handle expiry if you use it
+    expires_at = row.get("pro_expires_at")
+    if expires_at:
+        try:
+            # Supabase returns ISO8601; datetime.fromisoformat handles "YYYY-MM-DDTHH:MM:SS+00:00"
+            exp = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+            if exp.tzinfo is None:
+                exp = exp.replace(tzinfo=timezone.utc)
+            if exp <= datetime.now(timezone.utc):
+                is_pro = False
+        except Exception:
+            # If parsing fails, fall back to is_pro flag only
+            pass
+
+    if not is_pro:
+        raise HTTPException(status_code=402, detail="Subscription required")
+
 
 
 
