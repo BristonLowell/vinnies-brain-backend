@@ -772,6 +772,24 @@ class ClaimSessionsRequest(BaseModel):
 END_TARGETS = {"end_done", "end_escalate", "end_not_applicable"}
 
 
+def get_relevant_facts(conn, year: int | None, user_message: str):
+    cur = conn.cursor()
+
+    cur.execute("""
+        select fact_text
+        from kb_facts
+        where
+            (years_min is null or years_min <= %s)
+        and
+            (years_max is null or years_max >= %s)
+        order by created_at desc
+        limit 10
+    """, (year, year))
+
+    rows = cur.fetchall()
+    return [r[0] for r in rows]
+
+
 def _dt_get_nodes(tree: Dict[str, Any]) -> Dict[str, Any]:
     nodes = tree.get("nodes")
     if not isinstance(nodes, dict):
