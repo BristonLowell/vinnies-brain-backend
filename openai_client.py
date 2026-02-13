@@ -155,6 +155,7 @@ def generate_answer(
     category: Optional[str] = None,
     history: Optional[List[Dict[str, Any]]] = None,
     pending_question: Optional[str] = None,
+    authoritative_facts: Optional[List[str]] = None,
 ) -> Tuple[str, List[str], float]:
     """
     Matches what main.py expects:
@@ -164,9 +165,10 @@ def generate_answer(
     transcript = _history_to_text(history)
 
     system_instructions = f"""
-You are Vinnie's Brain, an AI assistant that ONLY provides information related to Airstream travel trailers (especially 2010–2025) and their systems, maintenance, troubleshooting, repairs, parts, ownership, and model-specific guidance.
+You are Vinnie's Brain, an AI assistant that ONLY provides information related to Airstream travel trailers (especially 2010–2026) and their systems, maintenance, troubleshooting, repairs, parts, ownership, and model-specific guidance.
 
 Hard rule:
+- Prefer the knowledge base context when present.
 - If the user's question is NOT directly related to Airstream trailers (or the question cannot reasonably be interpreted as Airstream-related), you MUST refuse.
 
 When refusing:
@@ -175,6 +177,11 @@ When refusing:
 - Invite the user to ask an Airstream-specific question
 - Do NOT provide general advice or an off-topic answer
 - Still return valid JSON in the required schema
+
+AUTHORITATIVE FACTS RULE:
+- If AUTHORITATIVE FACTS are provided, they override general knowledge.
+- Do NOT contradict them.
+- If uncertain, defer to them.
 
 CONTEXT ANCHOR (reduce confusion on short replies):
 - If the input includes a PENDING_QUESTION, treat the user's message as answering it.
@@ -238,13 +245,26 @@ Return STRICT JSON:
     kb_block = (context or "").strip()
     hist_block = transcript
 
+    facts_block = ""
+    if authoritative_facts:
+        cleaned_facts = [f.strip() for f in authoritative_facts if f and f.strip()]
+        if cleaned_facts:
+            facts_block = "AUTHORITATIVE FACTS:\n"
+            for f in cleaned_facts[:8]:  # limit to avoid prompt bloat
+                facts_block += f"- {f}\n"
+
+
     user_block_parts: List[str] = []
+
+    # 🔥 Inject facts FIRST (highest authority)
+    if facts_block:
+        user_block_parts.append(facts_block)
 
     if kb_block:
         user_block_parts.append("KNOWLEDGE BASE CONTEXT:\n" + kb_block)
 
-    if hist_block:
-        user_block_parts.append("RECENT CHAT HISTORY:\n" + hist_block)
+        if hist_block:
+            user_block_parts.append("RECENT CHAT HISTORY:\n" + hist_block)
 
     # 🔒 STEP C — anchor the user's reply to the last clarifying question
     pending_q = (pending_question or "").strip()
