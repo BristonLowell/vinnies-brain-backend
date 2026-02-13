@@ -1870,6 +1870,14 @@ def chat(req: ChatRequest):
 
         history = get_recent_messages(conn, req.session_id, limit=50)
 
+        # 🔥 Fetch authoritative micro-facts
+        authoritative_facts = []
+        try:
+            authoritative_facts = get_relevant_facts(conn, year, req.message)
+        except Exception:
+            authoritative_facts = []
+
+
         # Step B: compute pending_q from the last stored assistant question
         pending_q = (active_question_text or "").strip()
         if pending_q.startswith("**") and pending_q.endswith("**") and len(pending_q) > 4:
@@ -1884,6 +1892,7 @@ def chat(req: ChatRequest):
                 category=category,
                 history=history,
                 pending_question=pending_q or None,   # ✅ add this line
+                authoritative_facts=authoritative_facts,
             )
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"LLM error: {e}")
