@@ -731,6 +731,10 @@ class LiveChatSendRequest(BaseModel):
     body: str
 
 
+class LiveChatOpenedRequest(BaseModel):
+    session_id: str
+
+
 class AdminLiveChatSendRequest(BaseModel):
     conversation_id: str
     body: str
@@ -2123,6 +2127,31 @@ def register_owner_push_token(req: OwnerPushTokenRequest):
         on_conflict="owner_id",
     )
     return {"ok": True}
+
+
+@app.post("/v1/livechat/opened")
+def livechat_opened(req: LiveChatOpenedRequest):
+    """Called once when a customer opens Live Chat.
+
+    - Ensures a conversation exists for the session
+    - Inserts a system message ("We will be with you shortly.")
+    - Sends an owner push notification so the admin is alerted immediately
+    """
+    conversation_id = get_or_create_conversation_for_session(req.session_id)
+
+    # Insert a system message (reads correctly for both customer + admin)
+    msg = supabase_insert_message(conversation_id, req.session_id, "system", "We will be with you shortly.")
+
+    token = get_owner_push_token(OWNER_SUPABASE_USER_ID) if OWNER_SUPABASE_USER_ID else None
+    if token:
+        send_expo_push(
+            token,
+            title="Live chat opened",
+            body="A customer opened live chat. Tap to view.",
+            data={"conversation_id": conversation_id, "session_id": req.session_id},
+        )
+
+    return {"ok": True, "conversation_id": conversation_id, "message": msg}
 
 
 @app.post("/v1/livechat/send")
