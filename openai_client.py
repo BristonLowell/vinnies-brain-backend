@@ -15,6 +15,14 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
 CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-5.2")
 
+# ✅ Default "always-on" authoritative facts for your domain.
+# Keep these tight, accurate, and scoped to your supported years.
+DEFAULT_AUTHORITATIVE_FACTS: List[str] = [
+    # Modern Airstream scope (your app): torsion axles, not leaf springs.
+    "Airstream travel trailers in the 2010–2026 model-year range use torsion axles (Dexter-style) in factory configuration, not leaf springs. "
+    "If the user mentions leaf springs, treat it as either incorrect terminology or an unusual modification and advise a quick visual verification."
+]
+
 
 def embed_text(text: str) -> List[float]:
     if not (text or "").strip():
@@ -141,7 +149,6 @@ def _strip_question_lines_from_answer(answer: str) -> str:
 
         cleaned_lines.append(line)
 
-    # Also remove leading empty lines created by stripping
     out = "\n".join(cleaned_lines).strip()
     return out
 
@@ -180,13 +187,6 @@ ACCURACY FIRST (ChatGPT-like):
 - If the user asks for something that depends on exact configuration, ask ONE clarifying question or provide safe verification steps.
 - When multiple answers are plausible, say "Most likely" vs "Also possible" and give a quick check to distinguish.
 - Prefer being correct and cautious over being fast and confident.
-
-When refusing:
-- Be polite and brief
-- State that you only answer Airstream-related questions
-- Invite the user to ask an Airstream-specific question
-- Do NOT provide general advice or an off-topic answer
-- Still return valid JSON in the required schema
 
 AUTHORITATIVE FACTS RULE:
 - If AUTHORITATIVE FACTS are provided, they override general knowledge.
@@ -231,7 +231,6 @@ ASSUME ONLY WHEN SAFE:
 - If key details are missing, proceed only with universally safe steps.
 - Do not assume facts that could change the answer materially.
 
-
 PROVIDE LIKELY CAUSES:
 - Include 1–2 likely causes in most responses, phrased as "Most likely: ..." and "Also possible: ...".
 - Keep it short.
@@ -240,10 +239,6 @@ KNOWN CONTEXT:
 - Airstream year: {airstream_year if airstream_year is not None else "unknown"}
 - Category: {category or "unknown"}
 - Safety flags: {", ".join(safety_flags) if safety_flags else "none"}
-
-OUTPUT RULES:
-- If you ask ONE clarifying question, keep the answer concise, include 1–2 likely causes, and do not provide long fix instructions yet.
-- The question itself must appear ONLY in clarifying_questions.
 
 Return STRICT JSON:
 {{
@@ -256,18 +251,26 @@ Return STRICT JSON:
     kb_block = (context or "").strip()
     hist_block = transcript
 
-    facts_block = ""
+    # ✅ Merge default authoritative facts + any dynamic ones passed in
+    merged_facts: List[str] = []
+    merged_facts.extend(DEFAULT_AUTHORITATIVE_FACTS)
     if authoritative_facts:
-        cleaned_facts = [f.strip() for f in authoritative_facts if f and f.strip()]
+        merged_facts.extend([f for f in authoritative_facts if f and f.strip()])
+
+    facts_block = ""
+    if merged_facts:
+        cleaned_facts = [f.strip() for f in merged_facts if f and f.strip()]
         if cleaned_facts:
             facts_block = "AUTHORITATIVE FACTS:\n"
-            for f in cleaned_facts[:8]:  # limit to avoid prompt bloat
+            for f in cleaned_facts[:12]:  # small cap to avoid bloat
                 facts_block += f"- {f}\n"
-
 
     user_block_parts: List[str] = []
 
-    # 🔥 Inject facts FIRST (highest authority)
+    # ✅ Inject facts FIRST (highest authority)  <-- this was missing in your current file
+    if facts_block:
+        user_block_parts.append(facts_block)
+
     if kb_block:
         user_block_parts.append("KNOWLEDGE BASE CONTEXT:\n" + kb_block)
 
@@ -275,26 +278,20 @@ Return STRICT JSON:
     if hist_block:
         user_block_parts.append("RECENT CHAT HISTORY:\n" + hist_block)
 
-
-    # 🔒 STEP C — anchor the user's reply to the last clarifying question
+    # Anchor user's reply to the last clarifying question
     pending_q = (pending_question or "").strip()
     if pending_q:
-        # defensively remove markdown wrappers if they slipped in
         if pending_q.startswith("**") and pending_q.endswith("**") and len(pending_q) > 4:
             pending_q = pending_q[2:-2].strip()
 
         user_block_parts.append(
-            "PENDING CLARIFYING QUESTION (the user is answering this now):\n"
-            + pending_q
+            "PENDING CLARIFYING QUESTION (the user is answering this now):\n" + pending_q
         )
 
     # USER MESSAGE ALWAYS COMES LAST
-    user_block_parts.append(
-        "USER MESSAGE:\n" + (user_message or "").strip()
-    )
+    user_block_parts.append("USER MESSAGE:\n" + (user_message or "").strip())
 
     full_input = "\n\n---\n\n".join(user_block_parts)
-
 
     resp = client.responses.create(
         model=CHAT_MODEL,
@@ -333,22 +330,19 @@ Return STRICT JSON:
                     chunks.append(t)
         answer = "\n".join(chunks).strip() or "Sorry — I couldn’t generate a response."
 
-    # --- UI FIX: remove any question lines from the top/body of the answer ---
-    # This ensures the question only appears in clarifying_questions (bottom of your UI).
+    # UI FIX: remove any question lines from the top/body of the answer
     answer = _strip_question_lines_from_answer(answer)
 
-    # --- UI FIX: bold the clarifying question (so the bottom question is bold) ---
+    # UI FIX: bold the clarifying question
     if clarifying:
         q = clarifying[0].strip()
-        # Avoid double-bolding
         if not (q.startswith("**") and q.endswith("**")):
             clarifying = [f"**{q}**"]
 
-    # --- AUTO ESCALATION-STYLE MESSAGE (repeat same question 2+ times) ---
+    # AUTO ESCALATION-STYLE MESSAGE (repeat same question 2+ times)
     candidate_questions: List[str] = []
 
     if clarifying:
-        # remove ** for repeat-detection normalization
         q0 = clarifying[0].strip()
         if q0.startswith("**") and q0.endswith("**") and len(q0) > 4:
             q0 = q0[2:-2].strip()
@@ -444,6 +438,7 @@ Return STRICT JSON:
 
     try:
         data = json.loads(out_text)
+
         def _as_list(x):
             return [str(i).strip() for i in (x or []) if str(i).strip()]
 
