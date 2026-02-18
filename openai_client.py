@@ -18,8 +18,17 @@ CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-5.2")
 # ✅ Default "always-on" authoritative facts for your domain.
 # Keep these tight, accurate, and scoped to your supported years.
 DEFAULT_AUTHORITATIVE_FACTS: List[str] = [
+    # Modern Airstream scope (your app): torsion axles, not leaf springs.
     "Airstream travel trailers in the 2010–2026 model-year range use torsion axles (Dexter-style) in factory configuration, not leaf springs. "
-    "If the user mentions leaf springs, treat it as either incorrect terminology or an unusual modification and advise a quick visual verification."
+    "If the user mentions leaf springs, treat it as either incorrect terminology or an unusual modification and advise a quick visual verification.",
+
+    # ✅ Wheel studs default for your supported years (avoid absolute claim)
+    "For Airstream travel trailers in the 2010–2026 range, wheel studs are typically 1/2\"-20 in factory configuration. "
+    "If the user reports a different stud size (e.g., 9/16\") treat it as a possible axle/hub swap or unusual configuration and advise verifying the placard/manual or measuring the stud.",
+
+    # ✅ Airstream-specific lug torque (prevents drift to generic RV numbers like 120)
+    "For factory Airstream travel trailers (2010–2026) with OEM wheels and 1/2\"-20 studs, the manufacturer lug nut torque specification is 110 ft-lb unless the trailer's tire/loading placard or owner documentation states otherwise. "
+    "If the trailer has aftermarket wheels, axle/hub swaps, or non-standard studs, instruct the user to verify the placard/manual and wheel manufacturer guidance before torquing."
 ]
 
 
@@ -188,16 +197,11 @@ SOURCE PRIORITY (HARD HIERARCHY):
 - If AUTHORITATIVE FACTS or KB conflict with generic RV norms, ALWAYS follow AUTHORITATIVE FACTS / KB.
 - Never “split the difference” between conflicting specs.
 
-NUMERIC SPEC LOCK (CRITICAL):
-- For any numeric specification (torque, tire pressure, fluid capacity, fuse size, wire gauge, sealant type, clearances, weights, etc.):
-  - Only give a specific number if it is explicitly present in AUTHORITATIVE FACTS or KNOWLEDGE BASE CONTEXT.
-  - If not present, DO NOT guess. Provide safe verification steps (placard, owner’s manual, component label, Airstream service doc) and explain what to look for.
-  - You may give a *non-numeric* directional guideline (e.g., “verify stud size first”) but not a definitive spec number.
-
 ACCURACY FIRST:
-- Do NOT guess. If you are not sure, say so briefly and give the safest next step.
-- Do NOT invent model-year-specific details, part numbers, wiring, specs, procedures, or policies.
+- Do NOT guess model-year-specific details you don’t have.
+- Do NOT invent part numbers, wiring, specs, procedures, or policies.
 - If the user asks for something that depends on exact configuration, ask ONE clarifying question or provide safe verification steps.
+- When multiple answers are plausible, say "Most likely" vs "Also possible" and give a quick check to distinguish.
 - Prefer being correct and cautious over being fast and confident.
 
 AUTHORITATIVE FACTS RULE:
@@ -268,7 +272,6 @@ Return STRICT JSON:
     if hist_block:
         user_block_parts.append("RECENT CHAT HISTORY:\n" + hist_block)
 
-    # Anchor user's reply to the last clarifying question
     pending_q = (pending_question or "").strip()
     if pending_q:
         if pending_q.startswith("**") and pending_q.endswith("**") and len(pending_q) > 4:
@@ -277,7 +280,6 @@ Return STRICT JSON:
             "PENDING CLARIFYING QUESTION (the user is answering this now):\n" + pending_q
         )
 
-    # USER MESSAGE ALWAYS COMES LAST
     user_block_parts.append("USER MESSAGE:\n" + (user_message or "").strip())
 
     full_input = "\n\n---\n\n".join(user_block_parts)
@@ -319,16 +321,13 @@ Return STRICT JSON:
                     chunks.append(t)
         answer = "\n".join(chunks).strip() or "Sorry — I couldn’t generate a response."
 
-    # UI FIX: remove any question lines from the top/body of the answer
     answer = _strip_question_lines_from_answer(answer)
 
-    # UI FIX: bold the clarifying question
     if clarifying:
         q = clarifying[0].strip()
         if not (q.startswith("**") and q.endswith("**")):
             clarifying = [f"**{q}**"]
 
-    # AUTO ESCALATION-STYLE MESSAGE (repeat same question 2+ times)
     candidate_questions: List[str] = []
 
     if clarifying:
@@ -359,7 +358,6 @@ Return STRICT JSON:
         confidence = min(confidence, 0.25)
         answer = _force_escalation_message()
 
-    # Clamp confidence
     if confidence < 0.0:
         confidence = 0.0
     if confidence > 1.0:
