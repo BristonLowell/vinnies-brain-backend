@@ -18,7 +18,6 @@ CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-5.2")
 # ✅ Default "always-on" authoritative facts for your domain.
 # Keep these tight, accurate, and scoped to your supported years.
 DEFAULT_AUTHORITATIVE_FACTS: List[str] = [
-    # Modern Airstream scope (your app): torsion axles, not leaf springs.
     "Airstream travel trailers in the 2010–2026 model-year range use torsion axles (Dexter-style) in factory configuration, not leaf springs. "
     "If the user mentions leaf springs, treat it as either incorrect terminology or an unusual modification and advise a quick visual verification."
 ]
@@ -181,11 +180,24 @@ Hard rule:
 SCOPE INTERPRETATION:
 - Even if the user’s message is short or generic, interpret it in the context of the user owning an Airstream travel trailer.
 
-ACCURACY FIRST (ChatGPT-like):
-- Do NOT guess. If you are not sure, say so briefly and ask for what you need or tell how to verify.
+SOURCE PRIORITY (HARD HIERARCHY):
+1) AUTHORITATIVE FACTS (Airstream placard/manual/service docs, or app-provided facts) are highest authority.
+2) KNOWLEDGE BASE CONTEXT (your curated KB) is next.
+3) RECENT CHAT HISTORY is context only (not authoritative).
+4) General knowledge is last resort.
+- If AUTHORITATIVE FACTS or KB conflict with generic RV norms, ALWAYS follow AUTHORITATIVE FACTS / KB.
+- Never “split the difference” between conflicting specs.
+
+NUMERIC SPEC LOCK (CRITICAL):
+- For any numeric specification (torque, tire pressure, fluid capacity, fuse size, wire gauge, sealant type, clearances, weights, etc.):
+  - Only give a specific number if it is explicitly present in AUTHORITATIVE FACTS or KNOWLEDGE BASE CONTEXT.
+  - If not present, DO NOT guess. Provide safe verification steps (placard, owner’s manual, component label, Airstream service doc) and explain what to look for.
+  - You may give a *non-numeric* directional guideline (e.g., “verify stud size first”) but not a definitive spec number.
+
+ACCURACY FIRST:
+- Do NOT guess. If you are not sure, say so briefly and give the safest next step.
 - Do NOT invent model-year-specific details, part numbers, wiring, specs, procedures, or policies.
 - If the user asks for something that depends on exact configuration, ask ONE clarifying question or provide safe verification steps.
-- When multiple answers are plausible, say "Most likely" vs "Also possible" and give a quick check to distinguish.
 - Prefer being correct and cautious over being fast and confident.
 
 AUTHORITATIVE FACTS RULE:
@@ -193,12 +205,12 @@ AUTHORITATIVE FACTS RULE:
 - Do NOT contradict them.
 - If uncertain, defer to them.
 
-CONTEXT ANCHOR (reduce confusion on short replies):
+CONTEXT ANCHOR:
 - If the input includes a PENDING_QUESTION, treat the user's message as answering it.
 - Stay on that diagnostic thread; do not switch topics unless the user explicitly asks to reset/switch.
 
 CRITICAL FORMAT RULE (UI requirement):
-- NEVER put the clarifying question in the "answer" text (especially not bold at the top).
+- NEVER put the clarifying question in the "answer" text.
 - If a question is required, put it ONLY in "clarifying_questions".
 - The "answer" must contain explanation / likely causes / next steps — but NO question.
 
@@ -209,31 +221,9 @@ Core behavior:
 - If a safety risk is present, lead with safety steps.
 - Prefer the knowledge base context when present.
 
-PRIMARY RULE (reduce repetitive questions):
-- Only ask a clarifying question if the user's answer would change the VERY NEXT STEP you would give.
-- If the next step would be the same either way, do NOT ask — proceed with the best safe next step.
-
-QUESTION STYLE:
-- Do NOT default to yes/no questions.
-- Prefer specific diagnostic questions that narrow the problem efficiently.
-- When helpful, ask as a multiple-choice question with 2–4 options (e.g., "Which best matches: A / B / C?").
-- Use yes/no only when the decision is truly binary and immediately branch-defining.
-
 QUESTION LIMIT:
 - Ask at most ONE clarifying question per message.
 - clarifying_questions MUST contain 0 or 1 items.
-
-ANTI-REPETITION:
-- Before asking any question, check recent chat history + context.
-- If the user already answered it (even implicitly), do not ask again. Move forward.
-
-ASSUME ONLY WHEN SAFE:
-- If key details are missing, proceed only with universally safe steps.
-- Do not assume facts that could change the answer materially.
-
-PROVIDE LIKELY CAUSES:
-- Include 1–2 likely causes in most responses, phrased as "Most likely: ..." and "Also possible: ...".
-- Keep it short.
 
 KNOWN CONTEXT:
 - Airstream year: {airstream_year if airstream_year is not None else "unknown"}
@@ -262,19 +252,19 @@ Return STRICT JSON:
         cleaned_facts = [f.strip() for f in merged_facts if f and f.strip()]
         if cleaned_facts:
             facts_block = "AUTHORITATIVE FACTS:\n"
-            for f in cleaned_facts[:12]:  # small cap to avoid bloat
+            for f in cleaned_facts[:12]:
                 facts_block += f"- {f}\n"
 
     user_block_parts: List[str] = []
 
-    # ✅ Inject facts FIRST (highest authority)  <-- this was missing in your current file
+    # ✅ Inject facts FIRST (highest authority)
     if facts_block:
         user_block_parts.append(facts_block)
 
     if kb_block:
         user_block_parts.append("KNOWLEDGE BASE CONTEXT:\n" + kb_block)
 
-    # ✅ Always include history if present (even when KB context is empty)
+    # ✅ Always include history if present
     if hist_block:
         user_block_parts.append("RECENT CHAT HISTORY:\n" + hist_block)
 
@@ -283,7 +273,6 @@ Return STRICT JSON:
     if pending_q:
         if pending_q.startswith("**") and pending_q.endswith("**") and len(pending_q) > 4:
             pending_q = pending_q[2:-2].strip()
-
         user_block_parts.append(
             "PENDING CLARIFYING QUESTION (the user is answering this now):\n" + pending_q
         )
@@ -385,16 +374,7 @@ def generate_checkpoint_summary(
     airstream_year: Optional[int] = None,
     category: Optional[str] = None,
 ) -> Dict[str, List[str]]:
-    """Return a compact progress summary for UI/admin.
-
-    Output:
-      {
-        "known": [...],
-        "ruled_out": [...],
-        "likely_causes": [...],
-        "next_checks": [...]
-      }
-    """
+    """Return a compact progress summary for UI/admin."""
     transcript = _history_to_text(history, max_items=24)
 
     instructions = f"""
