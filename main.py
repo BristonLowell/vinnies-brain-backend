@@ -67,7 +67,7 @@ logger = logging.getLogger("vinniesbrain")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
 POOL_MIN_SIZE = int(os.getenv("DB_POOL_MIN", "1"))
-POOL_MAX_SIZE = int(os.getenv("DB_POOL_MAX", "6"))
+POOL_MAX_SIZE = int(os.getenv("DB_POOL_MAX", "15"))
 
 DB_POOL: ConnectionPool = ConnectionPool(
     conninfo=DATABASE_URL,
@@ -1717,20 +1717,67 @@ def admin_ai_history(session_id: str, x_admin_key: str = Header(default="", alia
 # -------------------------
 @app.post("/v1/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
+    """
+    IMPORTANT: This endpoint MUST NOT hold a DB pool connection while calling OpenAI/Supabase/other network APIs.
+    We split into phases:
+      1) DB read + quick session updates
+      2) Slow network calls (OpenAI)
+      3) DB write (log messages, store active_question_text)
+    """
+
+    # -------------------------
+    # Phase 1: DB READ (fast)
+    # -------------------------
+    sess: Dict[str, Any] = {}
+    year: Optional[int] = None
+    category: Optional[str] = None
+    flags: List[str] = []
+    pin_supported = False
+    aq_supported = False
+    active_article_id = None
+    active_node_id = None
+    active_tree: Any = None
+    active_question_text: Optional[str] = None
+    pending_q: Optional[str] = None
+
+    used_articles: List[Dict[str, str]] = []
+    context_chunks: List[str] = []
+    from_kb = False
+
+    history: List[Dict[str, Any]] = []
+
+    authoritative_facts: List[str] = []
+
+    # We may need vector search; embedding must be computed outside DB
+    need_vector_search = False
+
+    # Store a couple things for later DB-write phase
+    q_to_store: Optional[str] = None
+
+    # Message id created early (stable for this response)
+    message_id = str(uuid.uuid4())
+
     with db() as conn:
         sess = get_session(conn, req.session_id)
-                        # ✅ Subscription gate (optional)
-        user_id = str(sess.get("user_id") or "").strip()
-        if user_id:
-            enforce_subscription_if_enabled(user_id)
 
+        # ✅ Subscription gate (optional) — keep here (Supabase REST call happens inside enforce_subscription_if_enabled,
+        # but we are NOT holding DB during that call in this block; however enforce reads Supabase (network).
+        # To keep DB clean, we only check the session user_id here and defer the network gate check outside DB.
+        # We'll do that right after this DB phase.
+        user_id = str(sess.get("user_id") or "").strip()
 
         year = req.airstream_year or sess.get("airstream_year")
         category = sess.get("category")
 
         flags = detect_safety_flags(req.message)
 
+        # Greetings / not-airstream can return fast without OpenAI
         if is_greeting(req.message):
+            # log user msg + assistant reply quickly
+            log_message(conn, req.session_id, "user", req.message)
+            log_message(conn, req.session_id, "assistant", "Hey! What Airstream issue are you dealing with today?")
+            conn.commit()
+
             return ChatResponse(
                 answer="Hey! What Airstream issue are you dealing with today?",
                 clarifying_questions=[],
@@ -1738,18 +1785,24 @@ def chat(req: ChatRequest):
                 confidence=0.7,
                 used_articles=[],
                 show_escalation=False,
-                message_id=str(uuid.uuid4()),
+                message_id=message_id,
             )
 
         if not is_airstream_question(req.message, year):
+            # log user msg + assistant reply quickly
+            msg = "I can help with Airstream troubleshooting. What system are you working on (water, electrical, appliances, leaks, etc.)?"
+            log_message(conn, req.session_id, "user", req.message)
+            log_message(conn, req.session_id, "assistant", msg)
+            conn.commit()
+
             return ChatResponse(
-                answer="I can help with Airstream troubleshooting. What system are you working on (water, electrical, appliances, leaks, etc.)?",
+                answer=msg,
                 clarifying_questions=[],
                 safety_flags=flags,
                 confidence=0.4,
                 used_articles=[],
                 show_escalation=False,
-                message_id=str(uuid.uuid4()),
+                message_id=message_id,
             )
 
         pin_supported = sessions_supports_pinning(conn)
@@ -1775,6 +1828,7 @@ def chat(req: ChatRequest):
             active_tree = None
             active_question_text = None
 
+        # Parse stored tree (if any)
         if isinstance(active_tree, str):
             try:
                 active_tree = json.loads(active_tree)
@@ -1788,17 +1842,26 @@ def chat(req: ChatRequest):
 
         use_pinned = bool(pin_supported and active_article_id and isinstance(active_tree, dict) and active_node_id and yn)
 
-        used_articles: List[Dict[str, str]] = []
-        context_chunks: List[str] = []
-        from_kb = False
+        # 🔥 Fetch authoritative micro-facts from DB (fast)
+        try:
+            authoritative_facts = get_relevant_facts(conn, year, req.message)
+        except Exception:
+            authoritative_facts = []
 
+        # Step B: compute pending_q from the last stored assistant question
+        pending_q = (active_question_text or "").strip()
+        if pending_q.startswith("**") and pending_q.endswith("**") and len(pending_q) > 4:
+            pending_q = pending_q[2:-2].strip()
+        if not pending_q:
+            pending_q = None
+
+        # Build context (DB-only work)
         if use_pinned:
             next_node = advance_node(active_tree, active_node_id, req.message)
 
             # update session node
             exec_no_return(conn, "UPDATE sessions SET active_node_id=%s WHERE id=%s", (next_node, req.session_id))
 
-            # pinned article only
             row = exec_one(
                 conn,
                 """
@@ -1825,142 +1888,209 @@ def chat(req: ChatRequest):
                     if qtext:
                         chunk += f"ACTIVE_TROUBLESHOOTING_NODE:\n{next_node}\nQUESTION:\n{qtext}\n"
 
-                # Also explicitly include the last asked question (if any)
                 if (active_question_text or "").strip():
                     chunk += f'\nLAST_AI_QUESTION:\n{active_question_text.strip()}\n'
 
                 context_chunks.append(chunk)
                 from_kb = True
 
+            conn.commit()
+
         else:
+            # Keyword search first (no OpenAI embedding)
             ranked = keyword_kb_articles(conn, req.message, year, category, top_k=6)
-            if not ranked:
-                q_emb = embed(req.message)
-                ranked = rank_kb_articles(conn, q_emb, year, category, top_k=6)
 
-            for r, score in ranked:
-                if score < 0.15:
-                    continue
+            if ranked:
+                for r, score in ranked:
+                    if score < 0.15:
+                        continue
+                    used_articles.append({"id": r["id"], "title": r["title"]})
 
-                used_articles.append({"id": r["id"], "title": r["title"]})
+                    rt = (r.get("retrieval_text") or "").strip()
+                    body = (r.get("body") or "").strip()
 
-                rt = (r.get("retrieval_text") or "").strip()
-                body = (r.get("body") or "").strip()
+                    chunk = f"TITLE: {r['title']}\n"
+                    if rt:
+                        chunk += f"RETRIEVAL_TEXT:\n{rt}\n"
+                    chunk += f"BODY:\n{body}"
+                    context_chunks.append(chunk)
 
-                chunk = f"TITLE: {r['title']}\n"
-                if rt:
-                    chunk += f"RETRIEVAL_TEXT:\n{rt}\n"
-                chunk += f"BODY:\n{body}"
-                context_chunks.append(chunk)
+                from_kb = len(context_chunks) > 0
 
-            from_kb = len(context_chunks) > 0
+                # Pin the top article/tree when available
+                if pin_supported and from_kb and ranked:
+                    top = ranked[0][0]
+                    tree = top.get("decision_tree")
+                    if isinstance(tree, dict) and tree.get("start") and tree.get("nodes"):
+                        exec_no_return(
+                            conn,
+                            """
+                            UPDATE sessions
+                               SET active_article_id=%s,
+                                   active_tree=%s,
+                                   active_node_id=%s
+                             WHERE id=%s
+                            """,
+                            (top["id"], json.dumps(tree), tree.get("start"), req.session_id),
+                        )
+                conn.commit()
+            else:
+                # No keyword results; we may do vector search, but embedding must happen OUTSIDE DB
+                need_vector_search = True
+                conn.commit()
 
-            # Pin the top article/tree when available
-            if pin_supported and from_kb and ranked:
-                top = ranked[0][0]
-                tree = top.get("decision_tree")
-                if isinstance(tree, dict) and tree.get("start") and tree.get("nodes"):
-                    exec_no_return(
-                        conn,
-                        """
-                        UPDATE sessions
-                           SET active_article_id=%s,
-                               active_tree=%s,
-                               active_node_id=%s
-                         WHERE id=%s
-                        """,
-                        (top["id"], json.dumps(tree), tree.get("start"), req.session_id),
-                    )
-
+        # Pull recent messages (DB)
         history = get_recent_messages(conn, req.session_id, limit=50)
 
-        # 🔥 Fetch authoritative micro-facts
-        authoritative_facts = []
+    # -------------------------
+    # Phase 1b: Optional subscription gate (NETWORK) — outside DB
+    # -------------------------
+    # We re-check session user_id without holding DB (enforce uses Supabase REST).
+    try:
+        uid = str(sess.get("user_id") or "").strip()
+        if uid:
+            enforce_subscription_if_enabled(uid)
+    except HTTPException:
+        # re-raise subscription required etc.
+        raise
+    except Exception:
+        # do not crash if subscription check fails unexpectedly
+        pass
+
+    # -------------------------
+    # Phase 2: Optional vector search (needs OpenAI embedding) — NO DB HELD
+    # -------------------------
+    if need_vector_search:
         try:
-            authoritative_facts = get_relevant_facts(conn, year, req.message)
+            q_emb = embed(req.message)  # OpenAI embeddings (network)
         except Exception:
-            authoritative_facts = []
+            q_emb = []
 
+        if q_emb:
+            with db() as conn:
+                ranked2 = rank_kb_articles(conn, q_emb, year, category, top_k=6)
 
-        # Step B: compute pending_q from the last stored assistant question
-        pending_q = (active_question_text or "").strip()
-        if pending_q.startswith("**") and pending_q.endswith("**") and len(pending_q) > 4:
-            pending_q = pending_q[2:-2].strip()
+                for r, score in ranked2:
+                    if score < 0.15:
+                        continue
+                    used_articles.append({"id": r["id"], "title": r["title"]})
 
-        try:
-            answer, clarifying, confidence = generate_answer(
-                user_message=rewritten_user_message,
-                context="\n\n---\n\n".join(context_chunks),
-                safety_flags=flags,
+                    rt = (r.get("retrieval_text") or "").strip()
+                    body = (r.get("body") or "").strip()
+
+                    chunk = f"TITLE: {r['title']}\n"
+                    if rt:
+                        chunk += f"RETRIEVAL_TEXT:\n{rt}\n"
+                    chunk += f"BODY:\n{body}"
+                    context_chunks.append(chunk)
+
+                from_kb = len(context_chunks) > 0
+
+                # Pin the top article/tree when available
+                if sessions_supports_pinning(conn) and from_kb and ranked2:
+                    top = ranked2[0][0]
+                    tree = top.get("decision_tree")
+                    if isinstance(tree, dict) and tree.get("start") and tree.get("nodes"):
+                        exec_no_return(
+                            conn,
+                            """
+                            UPDATE sessions
+                               SET active_article_id=%s,
+                                   active_tree=%s,
+                                   active_node_id=%s
+                             WHERE id=%s
+                            """,
+                            (top["id"], json.dumps(tree), tree.get("start"), req.session_id),
+                        )
+                        conn.commit()
+
+    # Prepare rewritten_user_message again (we computed it inside DB phase, but keep it stable)
+    rewritten_user_message = rewrite_short_answer(req.message, active_question_text)
+
+    # -------------------------
+    # Phase 2: LLM call (NO DB HELD)
+    # -------------------------
+    try:
+        answer, clarifying, confidence = generate_answer(
+            user_message=rewritten_user_message,
+            context="\n\n---\n\n".join(context_chunks),
+            safety_flags=flags,
+            airstream_year=year,
+            category=category,
+            history=history,
+            pending_question=pending_q or None,
+            authoritative_facts=authoritative_facts,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"LLM error: {e}")
+
+    # Subtle check-in (only when from_kb)
+    answer = maybe_append_subtle_checkin(
+        answer=answer,
+        clarifying=clarifying,
+        confidence=confidence,
+        from_kb=from_kb,
+        history=history,
+    )
+
+    # Checkpoint summary (every 3 assistant messages per your code)
+    checkpoint_summary = None
+    try:
+        assistant_count = sum(
+            1 for h in (history or []) if (h.get("role") or "").strip().lower() == "assistant"
+        )
+        if (assistant_count + 1) % 3 == 0:
+            checkpoint_summary = generate_checkpoint_summary(
+                history=history,
                 airstream_year=year,
                 category=category,
-                history=history,
-                pending_question=pending_q or None,   # ✅ add this line
-                authoritative_facts=authoritative_facts,
             )
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"LLM error: {e}")
-
-
-        # Subtle check-in (NEW): occasionally append a gentle “let me know what happened after trying that”
-        answer = maybe_append_subtle_checkin(
-            answer=answer,
-            clarifying=clarifying,
-            confidence=confidence,
-            from_kb=from_kb,
-            history=history,
-        )
-
-        # Checkpoint summary (every ~6 assistant messages): helps users + admins see progress.
+    except Exception:
         checkpoint_summary = None
-        try:
-            assistant_count = sum(
-                1
-                for h in (history or [])
-                if (h.get("role") or "").strip().lower() == "assistant"
-            )
-            # Generate on the 6th, 12th, 18th... assistant response
-            if (assistant_count + 1) % 3 == 0:
-                checkpoint_summary = generate_checkpoint_summary(
-                    history=history,
-                    airstream_year=year,
-                    category=category,
-                )
-        except Exception:
-            checkpoint_summary = None
 
-# If the AI asked a clarifying question, store it as active_question_text.
-# We store it *without* markdown wrappers so we can reliably anchor the next user reply.
-        if aq_supported:
-            q_to_store = (clarifying[0] if (isinstance(clarifying, list) and len(clarifying) > 0) else "").strip()
-            if q_to_store.startswith("**") and q_to_store.endswith("**") and len(q_to_store) > 4:
-                q_to_store = q_to_store[2:-2].strip()
+    # Store last asked question (without ** wrappers)
+    if aq_supported:
+        q_to_store = (clarifying[0] if (isinstance(clarifying, list) and len(clarifying) > 0) else "").strip()
+        if q_to_store.startswith("**") and q_to_store.endswith("**") and len(q_to_store) > 4:
+            q_to_store = q_to_store[2:-2].strip()
+        if not q_to_store:
+            q_to_store = None
+
+    # -------------------------
+    # Phase 3: DB WRITE (fast)
+    # -------------------------
+    with db() as conn:
+        # Update active_question_text (if supported)
+        if sessions_supports_active_question(conn):
             exec_no_return(
                 conn,
                 "UPDATE sessions SET active_question_text=%s WHERE id=%s",
-                (q_to_store or None, req.session_id),
+                (q_to_store, req.session_id),
             )
 
-
-        message_id = str(uuid.uuid4())
+        # Log messages + telemetry
         log_message(conn, req.session_id, "user", req.message)
         _telemetry_insert(conn, req.session_id, "chat_user_message", {"len": len((req.message or ""))})
+
         log_message(conn, req.session_id, "assistant", answer)
         _telemetry_insert(conn, req.session_id, "chat_assistant_message", {"len": len((answer or "")), "from_kb": from_kb})
+
         if checkpoint_summary is not None:
             _telemetry_insert(conn, req.session_id, "checkpoint_generated", {})
+
         conn.commit()
 
-        return ChatResponse(
-            answer=answer,
-            checkpoint_summary=CheckpointSummary(**checkpoint_summary) if isinstance(checkpoint_summary, dict) else None,
-            clarifying_questions=clarifying,
-            safety_flags=flags,
-            confidence=confidence,
-            used_articles=[UsedArticle(**a) for a in used_articles],
-            show_escalation=True,
-            message_id=message_id,
-        )
+    return ChatResponse(
+        answer=answer,
+        checkpoint_summary=CheckpointSummary(**checkpoint_summary) if isinstance(checkpoint_summary, dict) else None,
+        clarifying_questions=clarifying,
+        safety_flags=flags,
+        confidence=confidence,
+        used_articles=[UsedArticle(**a) for a in used_articles],
+        show_escalation=True,
+        message_id=message_id,
+    )
+
 
 
 
