@@ -23,12 +23,14 @@ DEFAULT_AUTHORITATIVE_FACTS: List[str] = [
     "If the user mentions leaf springs, treat it as either incorrect terminology or an unusual modification and advise a quick visual verification.",
 
     # ✅ Wheel studs default for your supported years (avoid absolute claim)
-    "For Airstream travel trailers in the 2010–2026 range, wheel studs are typically 1/2\"-20 in factory configuration. "
+    "For Airstream travel trailers in the 2010–2026 range, wheel studs are always 1/2\"-20 in factory configuration. "
     "If the user reports a different stud size (e.g., 9/16\") treat it as a possible axle/hub swap or unusual configuration and advise verifying the placard/manual or measuring the stud.",
 
-    # ✅ Airstream-specific lug torque (prevents drift to generic RV numbers like 120)
-    "For factory Airstream travel trailers (2010–2026) with OEM wheels and 1/2\"-20 studs, the manufacturer lug nut torque specification is 110 ft-lb unless the trailer's tire/loading placard or owner documentation states otherwise. "
-    "If the trailer has aftermarket wheels, axle/hub swaps, or non-standard studs, instruct the user to verify the placard/manual and wheel manufacturer guidance before torquing."
+     # ✅ Correct torque specs by wheel material
+    "For factory Airstream travel trailers (2010–2026) with OEM 1/2\"-20 studs: "
+    "Aluminum wheels torque to 110 ft-lb. "
+    "Steel wheels torque to 100 ft-lb. "
+    "If wheel type is unknown, instruct the user to verify wheel material or check the trailer placard before torquing."
 ]
 
 
