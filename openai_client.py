@@ -171,6 +171,9 @@ Hard rule:
 - Prefer the knowledge base context when present.
 - If the user's question is NOT directly related to Airstream trailers (or the question cannot reasonably be interpreted as Airstream-related), you MUST refuse.
 
+SCOPE INTERPRETATION:
+- Even if the user’s message is short or generic, interpret it in the context of the user owning an Airstream travel trailer.
+
 ACCURACY FIRST (ChatGPT-like):
 - Do NOT guess. If you are not sure, say so briefly and ask for what you need or tell how to verify.
 - Do NOT invent model-year-specific details, part numbers, wiring, specs, procedures, or policies.
@@ -265,14 +268,13 @@ Return STRICT JSON:
     user_block_parts: List[str] = []
 
     # 🔥 Inject facts FIRST (highest authority)
-    if facts_block:
-        user_block_parts.append(facts_block)
-
     if kb_block:
         user_block_parts.append("KNOWLEDGE BASE CONTEXT:\n" + kb_block)
 
-        if hist_block:
-            user_block_parts.append("RECENT CHAT HISTORY:\n" + hist_block)
+    # ✅ Always include history if present (even when KB context is empty)
+    if hist_block:
+        user_block_parts.append("RECENT CHAT HISTORY:\n" + hist_block)
+
 
     # 🔒 STEP C — anchor the user's reply to the last clarifying question
     pending_q = (pending_question or "").strip()
