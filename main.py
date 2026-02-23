@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 import hashlib
 from datetime import datetime, timezone
 
+
 import smtplib
 from email.message import EmailMessage
 
@@ -36,6 +37,8 @@ except Exception:
     import urllib.request
 
 load_dotenv()
+
+
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/vinniesbrain")
 
@@ -1478,22 +1481,39 @@ def _hash_admin_key(raw_key: str) -> str:
     return hashlib.sha256(material).hexdigest()
 
 
+def get_admin_push_tokens_for_notifications() -> List[str]:
+    """
+    Returns ALL Expo push tokens registered for admin notifications.
+
+    Why list?
+    - Supports multiple admin devices
+    - Avoids subtle mismatches where the server's ADMIN_API_KEY differs from the key used to register
+      the token (X-Admin-Key), which would otherwise result in *no* notifications.
+    """
+    rows = sb_get("admin_push_tokens", {"select": "expo_push_token", "order": "updated_at.desc", "limit": "50"})
+    out: List[str] = []
+    for r in (rows or []):
+        tok = (r or {}).get("expo_push_token")
+        if isinstance(tok, str) and tok.strip():
+            out.append(tok.strip())
+
+    # de-dupe while preserving order
+    seen: Set[str] = set()
+    uniq: List[str] = []
+    for t in out:
+        if t in seen:
+            continue
+        seen.add(t)
+        uniq.append(t)
+    return uniq
+
+
 def get_admin_push_token_for_notifications() -> Optional[str]:
     """
-    Returns the Expo push token for the server's configured ADMIN_API_KEY.
-    This is what we use when a customer opens/sends live chat.
+    Back-compat helper: returns the most recently registered admin token (if any).
     """
-    if not ADMIN_API_KEY:
-        return None
-
-    kh = _hash_admin_key(ADMIN_API_KEY)
-    if not kh:
-        return None
-
-    rows = sb_get("admin_push_tokens", {"select": "expo_push_token", "key_hash": f"eq.{kh}", "limit": "1"})
-    if rows and isinstance(rows, list):
-        return (rows[0] or {}).get("expo_push_token")
-    return None
+    toks = get_admin_push_tokens_for_notifications()
+    return toks[0] if toks else None
 
 
 # =========================
@@ -2328,22 +2348,89 @@ def register_admin_push_token(
     _ = sb_upsert("admin_push_tokens", payload, on_conflict="key_hash")
     return {"ok": True}
 
+def _parse_iso_dt(s: str) -> Optional[datetime]:
+    try:
+        if not s:
+            return None
+        # Supabase often returns Z for UTC
+        s2 = s.replace("Z", "+00:00")
+        return datetime.fromisoformat(s2)
+    except Exception:
+        return None
+
+
+def _is_probable_duplicate_message(
+    conversation_id: str,
+    sender_role: str,
+    sender_id: str,
+    body: str,
+    within_seconds: int = 5,
+) -> Optional[Dict[str, Any]]:
+    """
+    Best-effort idempotency for live chat sends.
+
+    If the client retries (or a tap is registered multiple times) we can end up inserting duplicates.
+    We treat a message as duplicate if the most recent message for the same conversation/sender/body
+    is very recent (within `within_seconds`).
+    """
+    try:
+        rows = sb_get(
+            "messages",
+            {
+                "select": "id,conversation_id,sender_id,sender_role,body,created_at",
+                "conversation_id": f"eq.{conversation_id}",
+                "sender_role": f"eq.{sender_role}",
+                "sender_id": f"eq.{sender_id}",
+                "body": f"eq.{body}",
+                "order": "created_at.desc",
+                "limit": "1",
+            },
+        )
+        if not rows:
+            return None
+
+        last = rows[0] or {}
+        dt = _parse_iso_dt(str(last.get("created_at") or ""))
+        if not dt:
+            return None
+
+        now = datetime.now(timezone.utc)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+
+        if abs((now - dt).total_seconds()) <= within_seconds:
+            return last
+    except Exception:
+        return None
+
+    return None
+
 
 @app.post("/v1/livechat/opened")
 def livechat_opened(req: LiveChatOpenedRequest):
     """Called once when a customer opens Live Chat.
 
     - Ensures a conversation exists for the session
-    - Inserts a system message ("We will be with you shortly.")
-    - Sends an owner push notification so the admin is alerted immediately
+    - Inserts a system message ("We will be with you shortly.") once (deduped)
+    - Sends owner push notifications so the admin is alerted immediately
     """
     conversation_id = get_or_create_conversation_for_session(req.session_id)
 
-    # Insert a system message (reads correctly for both customer + admin)
-    msg = supabase_insert_message(conversation_id, req.session_id, "system", "We will be with you shortly.")
+    system_body = "We will be with you shortly."
+    existing = _is_probable_duplicate_message(
+        conversation_id=conversation_id,
+        sender_role="system",
+        sender_id=req.session_id,
+        body=system_body,
+        within_seconds=30,  # allow a longer window for "opened" re-entries
+    )
 
-    token = get_admin_push_token_for_notifications()
-    if token:
+    if existing:
+        msg = existing
+    else:
+        msg = supabase_insert_message(conversation_id, req.session_id, "system", system_body)
+
+    for token in get_admin_push_tokens_for_notifications():
         send_expo_push(
             token,
             title="Live chat opened",
@@ -2357,14 +2444,30 @@ def livechat_opened(req: LiveChatOpenedRequest):
 @app.post("/v1/livechat/send")
 def livechat_send(req: LiveChatSendRequest):
     conversation_id = get_or_create_conversation_for_session(req.session_id)
-    msg = supabase_insert_message(conversation_id, req.session_id, "customer", req.body)
 
-    token = get_admin_push_token_for_notifications()
-    if token:
+    body = (req.body or "").strip()
+    if not body:
+        raise HTTPException(status_code=400, detail="Missing body")
+
+    # Best-effort idempotency: prevent accidental duplicate inserts (e.g., client retries)
+    existing = _is_probable_duplicate_message(
+        conversation_id=conversation_id,
+        sender_role="customer",
+        sender_id=req.session_id,
+        body=body,
+        within_seconds=6,
+    )
+    if existing:
+        msg = existing
+    else:
+        msg = supabase_insert_message(conversation_id, req.session_id, "customer", body)
+
+    # Notify ALL registered admin devices
+    for token in get_admin_push_tokens_for_notifications():
         send_expo_push(
             token,
             title="New chat message",
-            body=req.body[:120],
+            body=body[:120],
             data={"conversation_id": conversation_id, "session_id": req.session_id},
         )
 
