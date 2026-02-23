@@ -47,6 +47,7 @@ SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 OWNER_SUPABASE_USER_ID = os.getenv("OWNER_SUPABASE_USER_ID", "").strip()
 
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", os.getenv("ADMIN_KEY", "")).strip()
+PUSH_TOKEN_SALT = os.getenv("PUSH_TOKEN_SALT", "vinniesbrain_push_tokens")
 
 # =========================
 # RevenueCat (Subscriptions)
