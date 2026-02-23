@@ -2409,37 +2409,31 @@ def _is_probable_duplicate_message(
 
 @app.post("/v1/livechat/opened")
 def livechat_opened(req: LiveChatOpenedRequest):
-    """Called once when a customer opens Live Chat.
-
-    - Ensures a conversation exists for the session
-    - Inserts a system message ("We will be with you shortly.") once (deduped)
-    - Sends owner push notifications so the admin is alerted immediately
-    """
     conversation_id = get_or_create_conversation_for_session(req.session_id)
 
-    system_body = "We will be with you shortly."
+    system_body = "Please tell us your name and we will be with you shortly."
     existing = _is_probable_duplicate_message(
         conversation_id=conversation_id,
         sender_role="system",
         sender_id=req.session_id,
         body=system_body,
-        within_seconds=30,  # allow a longer window for "opened" re-entries
+        within_seconds=30,
     )
 
-    if existing:
-        msg = existing
-    else:
-        msg = supabase_insert_message(conversation_id, req.session_id, "system", system_body)
+    if not existing:
+        supabase_insert_message(conversation_id, req.session_id, "system", system_body)
 
-    for token in get_admin_push_tokens_for_notifications():
-        send_expo_push(
-            token,
-            title="Live chat opened",
-            body="A customer opened live chat. Tap to view.",
-            data={"conversation_id": conversation_id, "session_id": req.session_id},
-        )
-
-    return {"ok": True, "conversation_id": conversation_id, "message": msg}
+    # ✅ Always return history so the client definitely receives the inserted message
+    rows = sb_get(
+        "messages",
+        {
+            "select": "id,conversation_id,sender_id,sender_role,body,created_at",
+            "conversation_id": f"eq.{conversation_id}",
+            "order": "created_at.asc",
+            "limit": "500",
+        },
+    )
+    return {"ok": True, "conversation_id": conversation_id, "messages": rows or []}
 
 
 @app.post("/v1/livechat/send")
