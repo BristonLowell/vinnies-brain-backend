@@ -745,6 +745,10 @@ class OwnerPushTokenRequest(BaseModel):
     expo_push_token: str
 
 
+class AdminPushTokenRequest(BaseModel):
+    expo_push_token: str
+
+
 class AdminArticleRequest(BaseModel):
     title: str
     category: str = "General"
@@ -2259,6 +2263,32 @@ def register_owner_push_token(req: OwnerPushTokenRequest):
     return {"ok": True}
 
 
+@app.post("/v1/admin/push-token")
+def register_admin_push_token(
+    req: AdminPushTokenRequest,
+    x_admin_key: str = Header(default="", alias="X-Admin-Key"),
+):
+    """Register this admin device for Expo push notifications.
+
+    Uses X-Admin-Key auth and stores the token against OWNER_SUPABASE_USER_ID.
+    """
+    require_admin(x_admin_key)
+
+    token = (req.expo_push_token or "").strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="Missing expo_push_token")
+
+    if not OWNER_SUPABASE_USER_ID:
+        raise HTTPException(status_code=500, detail="OWNER_SUPABASE_USER_ID not configured")
+
+    _ = sb_upsert(
+        "owner_push_tokens",
+        [{"owner_id": OWNER_SUPABASE_USER_ID, "expo_push_token": token}],
+        on_conflict="owner_id",
+    )
+    return {"ok": True}
+
+
 @app.post("/v1/livechat/opened")
 def livechat_opened(req: LiveChatOpenedRequest):
     """Called once when a customer opens Live Chat.
@@ -2397,35 +2427,65 @@ def admin_update_escalation(
 def admin_livechat_conversations(x_admin_key: str = Header(default="", alias="X-Admin-Key")):
     require_admin(x_admin_key)
 
-    msg_rows = sb_get(
-        "messages",
-        {"select": "id,conversation_id,sender_role,body,created_at", "order": "created_at.desc", "limit": "300"},
+    # 1) Pull the most recent conversations directly so a newly-opened chat shows up immediately,
+    #    even before the customer sends a message.
+    conv_rows = sb_get(
+        "conversations",
+        {
+            "select": "id,customer_id,created_at",
+            "order": "created_at.desc",
+            "limit": "60",
+        },
     )
 
-    conv_ids: List[str] = []
-    last_by_conv: Dict[str, Dict[str, Any]] = {}
+    if not conv_rows:
+        return {"conversations": []}
 
-    for r in (msg_rows or []):
-        cid = r.get("conversation_id")
-        if not cid or cid in last_by_conv:
-            continue
-        last_by_conv[cid] = {"sender_role": r.get("sender_role"), "body": r.get("body"), "created_at": r.get("created_at")}
-        conv_ids.append(cid)
-        if len(conv_ids) >= 50:
-            break
+    conv_ids = [c.get("id") for c in conv_rows if c.get("id")]
+    conv_ids = [c for c in conv_ids if isinstance(c, str) and c.strip()]
 
     if not conv_ids:
         return {"conversations": []}
 
-    conv_rows = sb_get("conversations", {"select": "id,customer_id,created_at", "id": f"in.({','.join(conv_ids)})"})
-    by_id = {c.get("id"): c for c in (conv_rows or [])}
+    # 2) Fetch recent messages for ONLY these conversations (fast + deterministic)
+    #    We'll compute "last message" per conversation.
+    msg_rows = sb_get(
+        "messages",
+        {
+            "select": "id,conversation_id,sender_role,body,created_at",
+            "conversation_id": f"in.({','.join(conv_ids)})",
+            "order": "created_at.desc",
+            "limit": "600",
+        },
+    )
 
-    conversations: List[Dict[str, Any]] = []
-    for cid in conv_ids:
-        c = by_id.get(cid) or {}
-        conversations.append({"conversation_id": cid, "customer_id": c.get("customer_id") or "", "last_message": last_by_conv.get(cid)})
+    last_by_conv: Dict[str, Dict[str, Any]] = {}
+    for r in (msg_rows or []):
+        cid = r.get("conversation_id")
+        if not cid or cid in last_by_conv:
+            continue
+        last_by_conv[cid] = {
+            "sender_role": r.get("sender_role"),
+            "body": r.get("body"),
+            "created_at": r.get("created_at"),
+        }
 
-    return {"conversations": conversations}
+    # 3) Build response in the same order as conversations table
+    out: List[Dict[str, Any]] = []
+    for c in conv_rows:
+        cid = c.get("id")
+        if not cid:
+            continue
+        out.append(
+            {
+                "conversation_id": cid,
+                "customer_id": c.get("customer_id") or "",
+                "created_at": c.get("created_at"),
+                "last_message": last_by_conv.get(cid),  # can be None (still shows up!)
+            }
+        )
+
+    return {"conversations": out}
 
 
 @app.get("/v1/admin/livechat/history/{conversation_id}")
