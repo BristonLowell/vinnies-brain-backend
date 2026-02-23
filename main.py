@@ -10,6 +10,8 @@ from urllib.parse import urlencode
 from collections import deque, defaultdict
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+import hashlib
+from datetime import datetime, timezone
 
 import smtplib
 from email.message import EmailMessage
@@ -1459,6 +1461,39 @@ def send_expo_push(expo_push_token: str, title: str, body: str, data: Optional[D
             requests.post("https://exp.host/--/api/v2/push/send", json=payload, timeout=10)
         except Exception:
             pass
+        
+def _hash_admin_key(raw_key: str) -> str:
+    """
+    Hash the admin key before storing/looking up push tokens.
+    This prevents your real admin key from being stored in Supabase.
+    """
+    key = (raw_key or "").strip()
+    if not key:
+        return ""
+
+    # If no salt is set, fallback to hashing raw key (still better than storing plaintext),
+    # but you SHOULD set PUSH_TOKEN_SALT in Render.
+    salt = PUSH_TOKEN_SALT or ""
+    material = f"{salt}:{key}".encode("utf-8")
+    return hashlib.sha256(material).hexdigest()
+
+
+def get_admin_push_token_for_notifications() -> Optional[str]:
+    """
+    Returns the Expo push token for the server's configured ADMIN_API_KEY.
+    This is what we use when a customer opens/sends live chat.
+    """
+    if not ADMIN_API_KEY:
+        return None
+
+    kh = _hash_admin_key(ADMIN_API_KEY)
+    if not kh:
+        return None
+
+    rows = sb_get("admin_push_tokens", {"select": "expo_push_token", "key_hash": f"eq.{kh}", "limit": "1"})
+    if rows and isinstance(rows, list):
+        return (rows[0] or {}).get("expo_push_token")
+    return None
 
 
 # =========================
@@ -2268,9 +2303,11 @@ def register_admin_push_token(
     req: AdminPushTokenRequest,
     x_admin_key: str = Header(default="", alias="X-Admin-Key"),
 ):
-    """Register this admin device for Expo push notifications.
+    """
+    Register this admin device for Expo push notifications.
 
-    Uses X-Admin-Key auth and stores the token against OWNER_SUPABASE_USER_ID.
+    Uses X-Admin-Key auth and stores the token keyed by a HASH of the admin key
+    (not tied to Supabase auth users / OWNER_SUPABASE_USER_ID).
     """
     require_admin(x_admin_key)
 
@@ -2278,14 +2315,17 @@ def register_admin_push_token(
     if not token:
         raise HTTPException(status_code=400, detail="Missing expo_push_token")
 
-    if not OWNER_SUPABASE_USER_ID:
-        raise HTTPException(status_code=500, detail="OWNER_SUPABASE_USER_ID not configured")
+    key_hash = _hash_admin_key(x_admin_key)
+    if not key_hash:
+        raise HTTPException(status_code=500, detail="Failed to hash admin key (check PUSH_TOKEN_SALT)")
 
-    _ = sb_upsert(
-        "owner_push_tokens",
-        [{"owner_id": OWNER_SUPABASE_USER_ID, "expo_push_token": token}],
-        on_conflict="owner_id",
-    )
+    payload = [{
+        "key_hash": key_hash,
+        "expo_push_token": token,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }]
+
+    _ = sb_upsert("admin_push_tokens", payload, on_conflict="key_hash")
     return {"ok": True}
 
 
@@ -2302,7 +2342,7 @@ def livechat_opened(req: LiveChatOpenedRequest):
     # Insert a system message (reads correctly for both customer + admin)
     msg = supabase_insert_message(conversation_id, req.session_id, "system", "We will be with you shortly.")
 
-    token = get_owner_push_token(OWNER_SUPABASE_USER_ID) if OWNER_SUPABASE_USER_ID else None
+    token = get_admin_push_token_for_notifications()
     if token:
         send_expo_push(
             token,
@@ -2319,7 +2359,7 @@ def livechat_send(req: LiveChatSendRequest):
     conversation_id = get_or_create_conversation_for_session(req.session_id)
     msg = supabase_insert_message(conversation_id, req.session_id, "customer", req.body)
 
-    token = get_owner_push_token(OWNER_SUPABASE_USER_ID) if OWNER_SUPABASE_USER_ID else None
+    token = get_admin_push_token_for_notifications()
     if token:
         send_expo_push(
             token,
