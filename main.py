@@ -2411,19 +2411,22 @@ def _is_probable_duplicate_message(
 def livechat_opened(req: LiveChatOpenedRequest):
     conversation_id = get_or_create_conversation_for_session(req.session_id)
 
-    system_body = "Please tell us your name and we will be with you shortly."
-    existing = _is_probable_duplicate_message(
-        conversation_id=conversation_id,
-        sender_role="system",
-        sender_id=req.session_id,
-        body=system_body,
-        within_seconds=30,
+    system_body = "Hello! Please tell us your name and we will be with you shortly."
+
+    # Only insert if there are zero messages in this conversation
+    existing = sb_get(
+        "messages",
+        {
+            "select": "id",
+            "conversation_id": f"eq.{conversation_id}",
+            "order": "created_at.asc",
+            "limit": "1",
+        },
     )
 
     if not existing:
         supabase_insert_message(conversation_id, req.session_id, "system", system_body)
 
-    # ✅ Always return history so the client definitely receives the inserted message
     rows = sb_get(
         "messages",
         {
@@ -2433,6 +2436,7 @@ def livechat_opened(req: LiveChatOpenedRequest):
             "limit": "500",
         },
     )
+
     return {"ok": True, "conversation_id": conversation_id, "messages": rows or []}
 
 
