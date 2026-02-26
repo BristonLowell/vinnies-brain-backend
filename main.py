@@ -73,13 +73,20 @@ logger = logging.getLogger("vinniesbrain")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
 POOL_MIN_SIZE = int(os.getenv("DB_POOL_MIN", "1"))
-POOL_MAX_SIZE = int(os.getenv("DB_POOL_MAX", "15"))
+POOL_MAX_SIZE = int(os.getenv("DB_POOL_MAX", "20"))
+
+# Borrow timeout: how long we wait to GET a pooled connection
+POOL_BORROW_TIMEOUT = float(os.getenv("DB_POOL_TIMEOUT", "30"))
+
+# How long an idle connection can sit before pool may recycle it (helps on platforms that drop idle TCP)
+POOL_MAX_IDLE = float(os.getenv("DB_POOL_MAX_IDLE", "60"))
 
 DB_POOL: ConnectionPool = ConnectionPool(
     conninfo=DATABASE_URL,
     min_size=POOL_MIN_SIZE,
     max_size=POOL_MAX_SIZE,
-    timeout=15,
+    timeout=POOL_BORROW_TIMEOUT,
+    max_idle=POOL_MAX_IDLE,
 )
 
 # naive in-memory rate limiting for /v1/chat (IP + session)
@@ -159,29 +166,57 @@ async def request_id_and_rate_limit(request: Request, call_next):
     return resp
 
 
+from psycopg_pool import PoolTimeout
+
 @contextmanager
 def db():
-    """Get a DB connection from the pool.
-
-    Supabase/Postgres can drop idle TCP connections. If we return a dead
-    connection to the pool, the next request can crash with:
-      psycopg.OperationalError: server closed the connection unexpectedly
-
-    So:
-    - If we hit a connection-level OperationalError, we DISCARD the conn.
-    - We rollback best-effort so pooled conns don't come back INTRANS.
     """
+    Get a DB connection from the pool.
 
-    conn = DB_POOL.getconn()
+    Improvements:
+    - Uses explicit borrow timeout (same as pool timeout)
+    - Sets statement_timeout to prevent long queries holding connections forever
+    - Logs pool stats on PoolTimeout so we can confirm exhaustion
+    - Always returns/discards connections safely
+    """
+    conn = None
     bad = False
+
     try:
+        try:
+            conn = DB_POOL.getconn(timeout=POOL_BORROW_TIMEOUT)
+        except PoolTimeout as e:
+            # Pool exhausted: log stats to prove it
+            try:
+                stats = DB_POOL.get_stats()
+                logger.warning("DB_POOL PoolTimeout: %s | stats=%s", e, stats)
+            except Exception:
+                logger.warning("DB_POOL PoolTimeout: %s | (no stats)", e)
+            raise
+
         conn.row_factory = dict_row
+
+        # Prevent any single query from hogging the pool.
+        # Tune with env. (Default 8s is plenty for your endpoints.)
+        stmt_ms = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "8000"))
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SET LOCAL statement_timeout = %s", (stmt_ms,))
+        except Exception:
+            # Not fatal
+            pass
+
         yield conn
+
     except psycopg.OperationalError:
         bad = True
         raise
+
     finally:
-        # Rollback best-effort (skip if broken/closed).
+        if conn is None:
+            return
+
+        # Rollback best-effort so pooled conns don't come back INTRANS.
         try:
             if not bad and getattr(conn, "closed", 0) == 0:
                 conn.rollback()
@@ -191,7 +226,6 @@ def db():
         # Return to pool OR discard.
         try:
             if bad or getattr(conn, "closed", 0) != 0:
-                # psycopg_pool supports close=True; if not, fallback to conn.close().
                 try:
                     DB_POOL.putconn(conn, close=True)  # type: ignore[arg-type]
                 except TypeError:
