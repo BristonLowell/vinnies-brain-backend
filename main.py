@@ -197,14 +197,18 @@ def db():
         conn.row_factory = dict_row
 
         # Prevent any single query from hogging the pool.
-        # Tune with env. (Default 8s is plenty for your endpoints.)
+       # Prevent any single query from hogging the pool.
         stmt_ms = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "8000"))
         try:
+            # IMPORTANT: don't parameter-bind SET LOCAL; if it errors it aborts the transaction
             with conn.cursor() as cur:
-                cur.execute("SET LOCAL statement_timeout = %s", (stmt_ms,))
+                cur.execute(f"SET LOCAL statement_timeout = {stmt_ms}")
         except Exception:
-            # Not fatal
-            pass
+            # If this SET fails, the transaction may now be aborted — clear it.
+            try:
+                conn.rollback()
+            except Exception:
+                pass
 
         yield conn
 
