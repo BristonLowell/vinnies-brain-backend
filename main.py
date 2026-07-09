@@ -217,38 +217,36 @@ def db():
         raise
 
     finally:
-        if conn is None:
-            return
-
-        # Rollback best-effort so pooled conns don't come back INTRANS.
-        try:
-            if not bad and getattr(conn, "closed", 0) == 0:
-                conn.rollback()
-        except Exception:
-            pass
-
-        # Return to pool OR discard.
-        try:
-            if bad or getattr(conn, "closed", 0) != 0:
-                try:
-                    DB_POOL.putconn(conn, close=True)  # type: ignore[arg-type]
-                except TypeError:
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
-                except Exception:
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
-            else:
-                DB_POOL.putconn(conn)
-        except Exception:
+        if conn is not None:
+            # Rollback best-effort so pooled conns don't come back INTRANS.
             try:
-                conn.close()
+                if not bad and getattr(conn, "closed", 0) == 0:
+                    conn.rollback()
             except Exception:
                 pass
+
+            # Return to pool OR discard.
+            try:
+                if bad or getattr(conn, "closed", 0) != 0:
+                    try:
+                        DB_POOL.putconn(conn, close=True)  # type: ignore[arg-type]
+                    except TypeError:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                    except Exception:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                else:
+                    DB_POOL.putconn(conn)
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
 
 def run_db_transaction(fn, attempts: int = 2):
@@ -1160,8 +1158,10 @@ def maybe_append_subtle_checkin(
 
 
 # =========================
-# Initial intake guard helpers (NEW)
+# Natural intake flow helpers
 # =========================
+INTAKE_QUESTION_TURNS = int(os.getenv("INTAKE_QUESTION_TURNS", "2"))
+
 _ISSUE_WORDS = {
     "not working", "won't", "wont", "doesn't", "doesnt", "can't", "cant",
     "broken", "dead", "error", "fault", "fail", "failed", "leak", "leaking",
@@ -1183,70 +1183,73 @@ def _history_role_count(history: List[Dict[str, Any]], role: str) -> int:
 
 
 def _looks_like_direct_info_request(text: str) -> bool:
-    """Avoid blocking simple fact/spec questions behind the troubleshooting intake gate."""
+    """Avoid blocking simple fact/spec questions behind the troubleshooting intake flow."""
     t = (text or "").strip().lower()
     if not t or "?" not in t:
         return False
-    has_issue_word = any(k in t for k in _ISSUE_WORDS)
-    if has_issue_word:
+    if any(k in t for k in _ISSUE_WORDS):
         return False
     return any(t.startswith(p) for p in _DIRECT_INFO_STARTS)
 
 
-def should_force_initial_intake_question(history: List[Dict[str, Any]], active_question_text: Optional[str], user_text: str) -> bool:
-    """On the first real troubleshooting message, ask for details before any advice/steps."""
-    if (active_question_text or "").strip():
-        return False
-    if _history_role_count(history, "user") > 0:
+def should_use_natural_intake_mode(history: List[Dict[str, Any]], user_text: str) -> bool:
+    """For the first couple real troubleshooting turns, let the AI ask natural questions only.
+
+    This is intentionally not a hard-coded question. It nudges the model to ask questions
+    based on the customer's actual words, then allows troubleshooting after the customer
+    has answered a couple of times.
+    """
+    if INTAKE_QUESTION_TURNS <= 0:
         return False
     if _looks_like_direct_info_request(user_text):
         return False
-    return True
+    return _history_role_count(history, "user") < INTAKE_QUESTION_TURNS
 
 
-def build_initial_intake_question(user_text: str, safety_flags: List[str]) -> str:
-    t = (user_text or "").lower()
+def build_natural_intake_instruction(history: List[Dict[str, Any]], safety_flags: List[str]) -> str:
+    user_turns_so_far = _history_role_count(history, "user")
+    remaining = max(1, INTAKE_QUESTION_TURNS - user_turns_so_far)
 
-    if "gas_or_co_risk" in safety_flags:
-        return "Do you smell propane/gas right now, is a CO alarm sounding, or is this only a past/intermittent warning?"
-    if "fire_risk" in safety_flags:
-        return "Is there active smoke/flame right now, a burning smell only, or damage you found after the fact?"
-    if "electrical_risk" in safety_flags:
-        return "Which electrical symptom best matches: no power, breaker/GFCI tripping, sparks/hot wiring, or one appliance/outlet not working?"
-
-    if any(k in t for k in ["leak", "leaking", "drip", "water", "stain", "wet", "soft floor"]):
-        return "Is it actively leaking now, only after rain, only when using plumbing, or just stains/damage you found later?"
-    if any(k in t for k in ["battery", "batteries", "12v", "converter", "inverter", "solar", "shore power", "outlet", "breaker", "gfci", "power"]):
-        return "Which power source are you on right now — shore power, battery only, generator, or solar — and what exactly is not working?"
-    if any(k in t for k in ["fridge", "refrigerator", "freezer"]):
-        return "Is the refrigerator on 120V, propane, or 12V right now, and what symptom do you see?"
-    if any(k in t for k in ["furnace", "heat", "heater", "ac", "air conditioner", "a/c", "cooling"]):
-        return "What is it doing: no response, fan only, starts then shuts off, error code, or not heating/cooling enough?"
-    if any(k in t for k in ["door", "window", "hatch", "lock", "latch"]):
-        return "What part is affected — door, window, hatch, latch, or lock — and is it stuck, loose, leaking, or damaged?"
-    if any(k in t for k in ["tow", "towing", "brake", "brakes", "axle", "tire", "wheel", "hitch", "sway"]):
-        return "Is this happening while towing, while parked, or during inspection, and what exact symptom are you seeing?"
-
-    return "Which system is affected, and what exactly are you seeing or hearing?"
-
-
-def build_initial_intake_answer(safety_flags: List[str]) -> str:
-    if "gas_or_co_risk" in safety_flags:
-        return (
-            "I’ll ask questions before recommending troubleshooting steps. Because this could involve propane or carbon monoxide, "
-            "treat it as a safety issue until we narrow it down."
+    safety_note = ""
+    if safety_flags:
+        safety_note = (
+            "If the issue involves immediate danger such as active fire, smoke, propane/gas smell, "
+            "carbon monoxide alarm, sparks, or hot wiring, include one brief safety warning first, "
+            "then ask the next question."
         )
-    if "fire_risk" in safety_flags:
-        return (
-            "I’ll ask questions before recommending troubleshooting steps. Because this could involve smoke, heat, or fire risk, "
-            "treat it as a safety issue until we narrow it down."
-        )
-    if "electrical_risk" in safety_flags:
-        return (
-            "I’ll ask questions before recommending troubleshooting steps. Because this could involve electrical risk, "
-            "I need to narrow down the symptom first."
-        )
-    return "I’ll ask a few quick questions before recommending troubleshooting steps so I don’t point you in the wrong direction."
+
+    return (
+        "CONVERSATION_FLOW_INSTRUCTION:\n"
+        "The customer is still in the intake/question phase. Do not give troubleshooting steps yet. "
+        "Do not provide a diagnosis, repair advice, numbered steps, or a checklist yet. "
+        "Ask one or two natural follow-up questions that are specific to the customer's exact problem and prior answers. "
+        "Do not use a canned or pre-formatted starter question. "
+        "Keep the response short and conversational. "
+        f"After about {remaining} more customer answer(s), move into troubleshooting steps based on what you learned. "
+        f"{safety_note}"
+    ).strip()
+
+
+def first_question_from_response(answer: str, clarifying: List[str]) -> Optional[str]:
+    """Store the last question even if the LLM put it in answer text instead of clarifying_questions."""
+    if isinstance(clarifying, list):
+        for q in clarifying:
+            qs = (q or "").strip()
+            if qs:
+                return qs[2:-2].strip() if qs.startswith("**") and qs.endswith("**") and len(qs) > 4 else qs
+
+    text = (answer or "").strip()
+    if not text or "?" not in text:
+        return None
+
+    for line in text.splitlines():
+        s = line.strip().strip("-• ")
+        if "?" in s:
+            q = s[: s.find("?") + 1].strip()
+            return q or None
+
+    q = text[: text.find("?") + 1].strip()
+    return q or None
 
 
 # =========================
@@ -1931,6 +1934,8 @@ def chat(req: ChatRequest):
     used_articles: List[Dict[str, str]] = []
     context_chunks: List[str] = []
     from_kb = False
+    natural_intake_mode = False
+    flow_instruction = ""
 
     history: List[Dict[str, Any]] = []
 
@@ -2024,37 +2029,6 @@ def chat(req: ChatRequest):
                 active_tree = None
 
         yn = normalize_yes_no(req.message)
-
-        # Before giving the first troubleshooting advice, force a short intake question.
-        # This prevents the first AI response from jumping straight into steps.
-        history = get_recent_messages(conn, req.session_id, limit=50)
-        if should_force_initial_intake_question(history, active_question_text, req.message):
-            first_question = build_initial_intake_question(req.message, flags)
-            answer = build_initial_intake_answer(flags)
-            assistant_log = f"{first_question}\n\n{answer}".strip()
-
-            if aq_supported:
-                exec_no_return(
-                    conn,
-                    "UPDATE sessions SET active_question_text=%s WHERE id=%s",
-                    (first_question, req.session_id),
-                )
-
-            log_message(conn, req.session_id, "user", req.message)
-            _telemetry_insert(conn, req.session_id, "chat_user_message", {"len": len((req.message or ""))})
-            log_message(conn, req.session_id, "assistant", assistant_log)
-            _telemetry_insert(conn, req.session_id, "chat_assistant_intake_question", {"len": len(assistant_log)})
-            conn.commit()
-
-            return ChatResponse(
-                answer=answer,
-                clarifying_questions=[first_question],
-                safety_flags=flags,
-                confidence=0.65,
-                used_articles=[],
-                show_escalation=False,
-                message_id=message_id,
-            )
 
         # If user says yes/no and we have a stored question, rewrite it so the model knows what it's answering.
         rewritten_user_message = rewrite_short_answer(req.message, active_question_text)
@@ -2160,6 +2134,9 @@ def chat(req: ChatRequest):
 
         # Pull recent messages (DB)
         history = get_recent_messages(conn, req.session_id, limit=50)
+        natural_intake_mode = should_use_natural_intake_mode(history, req.message)
+        if natural_intake_mode:
+            flow_instruction = build_natural_intake_instruction(history, flags)
 
     # -------------------------
     # Phase 1b: Optional subscription gate (NETWORK) — outside DB
@@ -2232,7 +2209,7 @@ def chat(req: ChatRequest):
     try:
         answer, clarifying, confidence = generate_answer(
             user_message=rewritten_user_message,
-            context="\n\n---\n\n".join(context_chunks),
+            context=(flow_instruction + "\n\n---\n\n" + "\n\n---\n\n".join(context_chunks)).strip() if flow_instruction else "\n\n---\n\n".join(context_chunks),
             safety_flags=flags,
             airstream_year=year,
             category=category,
@@ -2244,13 +2221,14 @@ def chat(req: ChatRequest):
         raise HTTPException(status_code=500, detail=f"LLM error: {e}")
 
     # Subtle check-in (only when from_kb)
-    answer = maybe_append_subtle_checkin(
-        answer=answer,
-        clarifying=clarifying,
-        confidence=confidence,
-        from_kb=from_kb,
-        history=history,
-    )
+    if not natural_intake_mode:
+        answer = maybe_append_subtle_checkin(
+            answer=answer,
+            clarifying=clarifying,
+            confidence=confidence,
+            from_kb=from_kb,
+            history=history,
+        )
 
     # Checkpoint summary (every 3 assistant messages per your code)
     checkpoint_summary = None
@@ -2269,11 +2247,14 @@ def chat(req: ChatRequest):
 
     # Store last asked question (without ** wrappers)
     if aq_supported:
-        q_to_store = (clarifying[0] if (isinstance(clarifying, list) and len(clarifying) > 0) else "").strip()
-        if q_to_store.startswith("**") and q_to_store.endswith("**") and len(q_to_store) > 4:
-            q_to_store = q_to_store[2:-2].strip()
-        if not q_to_store:
-            q_to_store = None
+        if natural_intake_mode:
+            q_to_store = first_question_from_response(answer, clarifying)
+        else:
+            q_to_store = (clarifying[0] if (isinstance(clarifying, list) and len(clarifying) > 0) else "").strip()
+            if q_to_store.startswith("**") and q_to_store.endswith("**") and len(q_to_store) > 4:
+                q_to_store = q_to_store[2:-2].strip()
+            if not q_to_store:
+                q_to_store = None
 
     # -------------------------
     # Phase 3: DB WRITE (fast)
@@ -2306,7 +2287,7 @@ def chat(req: ChatRequest):
         safety_flags=flags,
         confidence=confidence,
         used_articles=[UsedArticle(**a) for a in used_articles],
-        show_escalation=True,
+        show_escalation=not natural_intake_mode,
         message_id=message_id,
     )
 
