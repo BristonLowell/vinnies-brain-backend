@@ -1160,6 +1160,96 @@ def maybe_append_subtle_checkin(
 
 
 # =========================
+# Initial intake guard helpers (NEW)
+# =========================
+_ISSUE_WORDS = {
+    "not working", "won't", "wont", "doesn't", "doesnt", "can't", "cant",
+    "broken", "dead", "error", "fault", "fail", "failed", "leak", "leaking",
+    "drip", "water", "smell", "smoke", "burning", "spark", "sparks", "hot",
+    "no power", "no heat", "not cooling", "not heating", "alarm", "stuck",
+    "jammed", "noise", "noisy", "issue", "problem", "trouble",
+}
+
+_DIRECT_INFO_STARTS = (
+    "what is", "what's", "what are", "how much", "how many", "where is",
+    "where are", "what size", "what torque", "what pressure", "do airstream",
+    "does airstream", "can i", "should i", "is it normal",
+)
+
+
+def _history_role_count(history: List[Dict[str, Any]], role: str) -> int:
+    role = (role or "").strip().lower()
+    return sum(1 for h in (history or []) if (h.get("role") or "").strip().lower() == role)
+
+
+def _looks_like_direct_info_request(text: str) -> bool:
+    """Avoid blocking simple fact/spec questions behind the troubleshooting intake gate."""
+    t = (text or "").strip().lower()
+    if not t or "?" not in t:
+        return False
+    has_issue_word = any(k in t for k in _ISSUE_WORDS)
+    if has_issue_word:
+        return False
+    return any(t.startswith(p) for p in _DIRECT_INFO_STARTS)
+
+
+def should_force_initial_intake_question(history: List[Dict[str, Any]], active_question_text: Optional[str], user_text: str) -> bool:
+    """On the first real troubleshooting message, ask for details before any advice/steps."""
+    if (active_question_text or "").strip():
+        return False
+    if _history_role_count(history, "user") > 0:
+        return False
+    if _looks_like_direct_info_request(user_text):
+        return False
+    return True
+
+
+def build_initial_intake_question(user_text: str, safety_flags: List[str]) -> str:
+    t = (user_text or "").lower()
+
+    if "gas_or_co_risk" in safety_flags:
+        return "Do you smell propane/gas right now, is a CO alarm sounding, or is this only a past/intermittent warning?"
+    if "fire_risk" in safety_flags:
+        return "Is there active smoke/flame right now, a burning smell only, or damage you found after the fact?"
+    if "electrical_risk" in safety_flags:
+        return "Which electrical symptom best matches: no power, breaker/GFCI tripping, sparks/hot wiring, or one appliance/outlet not working?"
+
+    if any(k in t for k in ["leak", "leaking", "drip", "water", "stain", "wet", "soft floor"]):
+        return "Is it actively leaking now, only after rain, only when using plumbing, or just stains/damage you found later?"
+    if any(k in t for k in ["battery", "batteries", "12v", "converter", "inverter", "solar", "shore power", "outlet", "breaker", "gfci", "power"]):
+        return "Which power source are you on right now — shore power, battery only, generator, or solar — and what exactly is not working?"
+    if any(k in t for k in ["fridge", "refrigerator", "freezer"]):
+        return "Is the refrigerator on 120V, propane, or 12V right now, and what symptom do you see?"
+    if any(k in t for k in ["furnace", "heat", "heater", "ac", "air conditioner", "a/c", "cooling"]):
+        return "What is it doing: no response, fan only, starts then shuts off, error code, or not heating/cooling enough?"
+    if any(k in t for k in ["door", "window", "hatch", "lock", "latch"]):
+        return "What part is affected — door, window, hatch, latch, or lock — and is it stuck, loose, leaking, or damaged?"
+    if any(k in t for k in ["tow", "towing", "brake", "brakes", "axle", "tire", "wheel", "hitch", "sway"]):
+        return "Is this happening while towing, while parked, or during inspection, and what exact symptom are you seeing?"
+
+    return "Which system is affected, and what exactly are you seeing or hearing?"
+
+
+def build_initial_intake_answer(safety_flags: List[str]) -> str:
+    if "gas_or_co_risk" in safety_flags:
+        return (
+            "I’ll ask questions before recommending troubleshooting steps. Because this could involve propane or carbon monoxide, "
+            "treat it as a safety issue until we narrow it down."
+        )
+    if "fire_risk" in safety_flags:
+        return (
+            "I’ll ask questions before recommending troubleshooting steps. Because this could involve smoke, heat, or fire risk, "
+            "treat it as a safety issue until we narrow it down."
+        )
+    if "electrical_risk" in safety_flags:
+        return (
+            "I’ll ask questions before recommending troubleshooting steps. Because this could involve electrical risk, "
+            "I need to narrow down the symptom first."
+        )
+    return "I’ll ask a few quick questions before recommending troubleshooting steps so I don’t point you in the wrong direction."
+
+
+# =========================
 # Pinned-flow helpers
 # =========================
 YES_NO_MAP = {
@@ -1934,6 +2024,37 @@ def chat(req: ChatRequest):
                 active_tree = None
 
         yn = normalize_yes_no(req.message)
+
+        # Before giving the first troubleshooting advice, force a short intake question.
+        # This prevents the first AI response from jumping straight into steps.
+        history = get_recent_messages(conn, req.session_id, limit=50)
+        if should_force_initial_intake_question(history, active_question_text, req.message):
+            first_question = build_initial_intake_question(req.message, flags)
+            answer = build_initial_intake_answer(flags)
+            assistant_log = f"{first_question}\n\n{answer}".strip()
+
+            if aq_supported:
+                exec_no_return(
+                    conn,
+                    "UPDATE sessions SET active_question_text=%s WHERE id=%s",
+                    (first_question, req.session_id),
+                )
+
+            log_message(conn, req.session_id, "user", req.message)
+            _telemetry_insert(conn, req.session_id, "chat_user_message", {"len": len((req.message or ""))})
+            log_message(conn, req.session_id, "assistant", assistant_log)
+            _telemetry_insert(conn, req.session_id, "chat_assistant_intake_question", {"len": len(assistant_log)})
+            conn.commit()
+
+            return ChatResponse(
+                answer=answer,
+                clarifying_questions=[first_question],
+                safety_flags=flags,
+                confidence=0.65,
+                used_articles=[],
+                show_escalation=False,
+                message_id=message_id,
+            )
 
         # If user says yes/no and we have a stored question, rewrite it so the model knows what it's answering.
         rewritten_user_message = rewrite_short_answer(req.message, active_question_text)
