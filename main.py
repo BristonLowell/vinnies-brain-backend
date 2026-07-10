@@ -18,6 +18,14 @@ from datetime import datetime, timezone
 import smtplib
 from email.message import EmailMessage
 
+# Optional direct OpenAI client for short escalation email summaries.
+# If this import or the API call fails, the backend falls back to a compact
+# deterministic summary instead of sending the full transcript.
+try:
+    from openai import OpenAI  # type: ignore
+except Exception:
+    OpenAI = None  # type: ignore
+
 
 import psycopg
 from psycopg.rows import dict_row
@@ -317,6 +325,13 @@ SUPPORT_EMAIL_TO = os.getenv("ESCALATION_EMAIL") or os.getenv("SUPPORT_EMAIL_TO"
 GMAIL_SMTP_USER = os.getenv("GMAIL_SMTP_USER", "").strip()
 GMAIL_SMTP_APP_PASSWORD = os.getenv("GMAIL_SMTP_APP_PASSWORD", "").strip()
 
+# Used only to summarize escalation emails. You can override this in Render with
+# OPENAI_ESCALATION_SUMMARY_MODEL.
+OPENAI_ESCALATION_SUMMARY_MODEL = os.getenv(
+    "OPENAI_ESCALATION_SUMMARY_MODEL",
+    os.getenv("OPENAI_SUMMARY_MODEL", "gpt-4o-mini"),
+).strip()
+
 def send_escalation_email(to_email: str, subject: str, body: str) -> bool:
     """Best-effort Gmail SMTP send.
 
@@ -451,6 +466,7 @@ def build_escalation_email_subject(session_id: str) -> str:
 
 
 def build_escalation_email_body(*, req: 'EscalationRequest', transcript: str, business_hours: bool) -> str:
+    """Legacy helper kept for compatibility. New escalation emails use the summary helper below."""
     lines: List[str] = []
     lines.append("Vinnies Brain — Escalation")
     lines.append("")
@@ -468,9 +484,286 @@ def build_escalation_email_body(*, req: 'EscalationRequest', transcript: str, bu
     lines.append("Issue summary")
     lines.append(req.message or "")
     lines.append("")
-    lines.append("AI troubleshooting transcript")
-    lines.append(transcript or "(no transcript found)")
+    lines.append("AI troubleshooting summary")
+    lines.append(generate_escalation_email_summary(
+        req=req,
+        transcript=transcript,
+        airstream_year=None,
+        business_hours=business_hours,
+    ))
     return "\n".join(lines).strip()
+
+
+def _compact_line(text: str, max_chars: int = 260) -> str:
+    """Single-line shortening for email summaries."""
+    out = re.sub(r"\s+", " ", (text or "").strip())
+    if len(out) <= max_chars:
+        return out
+    return out[: max_chars - 1].rstrip() + "…"
+
+
+def _fallback_escalation_email_summary(
+    *,
+    req: 'EscalationRequest',
+    transcript: str,
+    airstream_year: Optional[int],
+    business_hours: bool,
+) -> str:
+    """Small non-AI fallback so emails stay short even if OpenAI is unavailable."""
+    lines: List[str] = []
+    lines.append("Customer requested email support from Vinnie's Brain.")
+    if airstream_year is not None:
+        lines.append(f"Airstream year: {airstream_year}")
+    lines.append(f"Submitted during business hours: {'yes' if business_hours else 'no'}")
+
+    issue = (req.message or "").strip()
+    if issue:
+        lines.append(f"Customer-entered issue: {_compact_line(issue, 500)}")
+
+    user_notes: List[str] = []
+    ai_steps: List[str] = []
+    for block in re.split(r"\n\s*\n", transcript or ""):
+        b = block.strip()
+        if b.startswith("YOU:"):
+            user_notes.append(_compact_line(b.replace("YOU:", "", 1), 220))
+        elif b.startswith("VINNIES:"):
+            ai_steps.append(_compact_line(b.replace("VINNIES:", "", 1), 220))
+
+    if user_notes:
+        lines.append("")
+        lines.append("Recent customer details:")
+        for item in user_notes[-5:]:
+            if item:
+                lines.append(f"- {item}")
+
+    if ai_steps:
+        lines.append("")
+        lines.append("Recent AI troubleshooting already suggested:")
+        for item in ai_steps[-3:]:
+            if item:
+                lines.append(f"- {item}")
+
+    if not user_notes and not ai_steps and transcript.strip():
+        lines.append("")
+        lines.append("Recent conversation:")
+        lines.append(_compact_line(transcript, 1200))
+
+    lines.append("")
+    lines.append("Full conversation remains saved in the admin AI history if more detail is needed.")
+    return "\n".join(lines).strip()[:3000]
+
+
+def generate_escalation_email_summary(
+    *,
+    req: 'EscalationRequest',
+    transcript: str,
+    airstream_year: Optional[int],
+    business_hours: bool,
+) -> str:
+    """Generate a concise support summary for escalation emails.
+
+    The goal is to avoid long emails while still giving Vinnie's enough context.
+    If OpenAI is not configured or the call fails, this returns a short fallback
+    summary instead of returning the full transcript.
+    """
+    transcript = (transcript or "").strip()
+    fallback = _fallback_escalation_email_summary(
+        req=req,
+        transcript=transcript,
+        airstream_year=airstream_year,
+        business_hours=business_hours,
+    )
+
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not transcript or OpenAI is None or not api_key:
+        return fallback
+
+    clipped_transcript = transcript[-12000:]
+    issue = (req.message or "").strip()
+
+    try:
+        client = OpenAI(api_key=api_key)  # type: ignore[operator]
+        resp = client.chat.completions.create(
+            model=OPENAI_ESCALATION_SUMMARY_MODEL or "gpt-4o-mini",
+            temperature=0.2,
+            max_tokens=500,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You summarize Airstream troubleshooting chats for Vinnie's support staff. "
+                        "Be concise, practical, and plain text only. Do not include the full transcript."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "Create a short email-ready support summary.\n\n"
+                        "Include these sections when information is available:\n"
+                        "- Main issue\n"
+                        "- Airstream year/category\n"
+                        "- Symptoms reported\n"
+                        "- Troubleshooting already suggested or tried\n"
+                        "- What still needs support\n"
+                        "- Urgency/safety notes\n\n"
+                        f"Customer-entered issue summary:\n{issue or '(none)'}\n\n"
+                        f"Known Airstream year: {airstream_year if airstream_year is not None else 'unknown'}\n"
+                        f"Submitted during business hours: {'yes' if business_hours else 'no'}\n\n"
+                        f"Conversation transcript:\n{clipped_transcript}"
+                    ),
+                },
+            ],
+        )
+
+        summary = (resp.choices[0].message.content or "").strip()
+        if not summary:
+            return fallback
+
+        # Reuse the chat cleaner if available; keep this safe if the helper changes later.
+        try:
+            summary = clean_ai_response_text(summary)
+        except Exception:
+            summary = summary.replace("**", "").replace("__", "").strip()
+
+        return summary[:3500].strip()
+
+    except Exception as e:
+        try:
+            print(f"Escalation AI summary failed: {e}")
+        except Exception:
+            pass
+        return fallback
+
+
+def _fallback_admin_troubleshooting_summary(
+    *,
+    session_id: str,
+    messages: List[Dict[str, Any]],
+    sess: Dict[str, Any],
+) -> str:
+    """Small non-AI summary for the admin live chat page."""
+    year = sess.get("airstream_year")
+    category = sess.get("category")
+
+    user_notes: List[str] = []
+    ai_steps: List[str] = []
+
+    for m in messages or []:
+        role = (m.get("role") or "").strip().lower()
+        text = _compact_line(m.get("text") or "", 260)
+        if not text:
+            continue
+        if role == "user":
+            user_notes.append(text)
+        elif role == "assistant":
+            # Keep assistant lines that look like actual troubleshooting, not greetings/intake only.
+            if looks_like_troubleshooting_response(text, natural_intake_mode=False):
+                ai_steps.append(text)
+
+    lines: List[str] = []
+    if year or category:
+        parts = []
+        if year:
+            parts.append(f"Airstream year: {year}")
+        if category:
+            parts.append(f"Category: {category}")
+        lines.append(" | ".join(parts))
+
+    if user_notes:
+        lines.append("Customer details reported:")
+        for item in user_notes[-5:]:
+            lines.append(f"- {item}")
+
+    if ai_steps:
+        lines.append("")
+        lines.append("Troubleshooting already suggested/tried:")
+        for item in ai_steps[-4:]:
+            lines.append(f"- {item}")
+
+    if not user_notes and not ai_steps:
+        lines.append("No troubleshooting history has been saved for this live chat yet.")
+
+    lines.append("")
+    lines.append(f"Session ID: {session_id}")
+    return "\n".join(lines).strip()[:3000]
+
+
+def generate_admin_troubleshooting_summary(
+    *,
+    session_id: str,
+    messages: List[Dict[str, Any]],
+    sess: Dict[str, Any],
+) -> str:
+    """Create a compact summary for the admin live chat page.
+
+    This lets the owner understand what the customer has already told the AI
+    and what troubleshooting has already been suggested without reading the
+    full transcript.
+    """
+    fallback = _fallback_admin_troubleshooting_summary(
+        session_id=session_id,
+        messages=messages,
+        sess=sess,
+    )
+
+    transcript = format_transcript(messages, max_chars=12000).strip()
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not transcript or OpenAI is None or not api_key:
+        return fallback
+
+    try:
+        client = OpenAI(api_key=api_key)  # type: ignore[operator]
+        resp = client.chat.completions.create(
+            model=OPENAI_ESCALATION_SUMMARY_MODEL or "gpt-4o-mini",
+            temperature=0.2,
+            max_tokens=450,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You summarize Airstream troubleshooting chats for the owner/admin. "
+                        "Be concise, practical, and plain text only. Do not include the full transcript."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "Summarize what the customer has already tried or been told to try.\n\n"
+                        "Use this format:\n"
+                        "Main issue:\n"
+                        "Customer reported:\n"
+                        "Troubleshooting already suggested/tried:\n"
+                        "Current status / what owner should ask next:\n"
+                        "Safety or urgency notes:\n\n"
+                        "Rules:\n"
+                        "- Keep it short enough to read quickly on a phone.\n"
+                        "- Focus on facts from the chat only.\n"
+                        "- If something is unknown, say unknown.\n"
+                        "- Do not include the full transcript.\n\n"
+                        f"Session ID: {session_id}\n"
+                        f"Airstream year: {sess.get('airstream_year') or 'unknown'}\n"
+                        f"Category: {sess.get('category') or 'unknown'}\n\n"
+                        f"Transcript:\n{transcript}"
+                    ),
+                },
+            ],
+        )
+
+        summary = (resp.choices[0].message.content or "").strip()
+        if not summary:
+            return fallback
+        try:
+            summary = clean_ai_response_text(summary)
+        except Exception:
+            summary = summary.replace("**", "").replace("__", "").strip()
+        return summary[:3500].strip()
+    except Exception as e:
+        try:
+            print(f"Admin AI troubleshooting summary failed: {e}")
+        except Exception:
+            pass
+        return fallback
+
 
 # =========================
 # Supabase REST helpers
@@ -1995,7 +2288,12 @@ def _admin_ai_history_payload(conn, session_id: str) -> Dict[str, Any]:
             continue
         out_msgs.append({"role": role, "text": text, "created_at": m.get("created_at")})
 
-    payload: Dict[str, Any] = {"session_id": session_id, "messages": out_msgs}
+    payload: Dict[str, Any] = {
+        "session_id": session_id,
+        "messages": out_msgs,
+        "airstream_year": sess.get("airstream_year"),
+        "category": sess.get("category"),
+    }
 
     if sessions_supports_pinning(conn):
         payload["active_article_id"] = sess.get("active_article_id")
@@ -2020,8 +2318,32 @@ def _admin_ai_history_payload(conn, session_id: str) -> Dict[str, Any]:
 @app.get("/v1/admin/ai-history/{session_id}")
 def admin_ai_history(session_id: str, x_admin_key: str = Header(default="", alias="X-Admin-Key")):
     require_admin(x_admin_key)
+
+    # Pull the transcript quickly while holding the DB connection, then generate
+    # the admin summary after the DB connection is released.
     with db() as conn:
-        return _admin_ai_history_payload(conn, session_id)
+        payload = _admin_ai_history_payload(conn, session_id)
+
+    try:
+        payload["troubleshooting_summary"] = generate_admin_troubleshooting_summary(
+            session_id=session_id,
+            messages=payload.get("messages") or [],
+            sess={
+                "airstream_year": payload.get("airstream_year"),
+                "category": payload.get("category"),
+            },
+        )
+    except Exception:
+        payload["troubleshooting_summary"] = _fallback_admin_troubleshooting_summary(
+            session_id=session_id,
+            messages=payload.get("messages") or [],
+            sess={
+                "airstream_year": payload.get("airstream_year"),
+                "category": payload.get("category"),
+            },
+        )
+
+    return payload
 
 
 # -------------------------
@@ -2454,9 +2776,10 @@ def create_escalation(req: EscalationRequest):
         except Exception:
             conversation_id = None
 
-    # Pull a little context (optional) from local chat log
+    # Pull context from the local chat log. The email will contain an AI summary,
+    # not the full transcript, but the transcript is still used to create that summary.
     airstream_year: Optional[int] = None
-    excerpt: Optional[str] = None
+    transcript_text: str = ""
     try:
         with db() as conn:
             srow = exec_one(conn, "SELECT airstream_year FROM sessions WHERE id=%s", (req.session_id,))
@@ -2468,21 +2791,20 @@ def create_escalation(req: EscalationRequest):
 
             mrows = exec_all(
                 conn,
-                "SELECT role, content, created_at FROM chat_messages WHERE session_id=%s ORDER BY created_at DESC LIMIT 12",
+                "SELECT role, content AS text, created_at FROM chat_messages WHERE session_id=%s ORDER BY created_at DESC LIMIT 40",
                 (req.session_id,),
             )
             if mrows:
-                lines = []
-                for r in reversed(mrows):
-                    role = (r.get("role") or "").strip() or "user"
-                    content = (r.get("content") or "").strip()
-                    if content:
-                        lines.append(f"{role}: {content}")
-                joined = "\n".join(lines).strip()
-                if joined:
-                    excerpt = joined[:4000]
+                transcript_text = format_transcript(list(reversed(mrows)), max_chars=9000)
     except Exception:
-        pass
+        transcript_text = ""
+
+    conversation_summary = generate_escalation_email_summary(
+        req=req,
+        transcript=transcript_text,
+        airstream_year=airstream_year,
+        business_hours=open_now,
+    )
 
     # Supabase escalations row (match your actual table schema)
     contact = ""
@@ -2499,7 +2821,8 @@ def create_escalation(req: EscalationRequest):
         "name": (req.name or "").strip() or None,
         "contact": contact or None,
         "preferred_contact": (req.preferred_contact or "").strip() or None,
-        "conversation_excerpt": excerpt,
+        # Store the shorter support summary in Supabase for the admin inbox.
+        "conversation_excerpt": conversation_summary,
         "status": "new",  # matches your table default
         "routing": routing,
         "business_hours": open_now,
@@ -2508,6 +2831,10 @@ def create_escalation(req: EscalationRequest):
             "source": "mobile",
             "routing": routing,
             "business_hours": open_now,
+            "ai_conversation_summary": conversation_summary,
+            # Keeps the full recent transcript out of the email, while preserving it
+            # in structured data for debugging/admin use if needed.
+            "recent_transcript": transcript_text,
         },
     }
 
@@ -2536,19 +2863,9 @@ def create_escalation(req: EscalationRequest):
             pass
 
     email_subject = build_escalation_email_subject(req.session_id)
-    email_subject = build_escalation_email_subject(req.session_id)
-
-    transcript_block = ""
-    if excerpt and excerpt.strip():
-        transcript_block = (
-            "\n\n"
-            "Conversation transcript (most recent)\n"
-            "------------------------------\n"
-            f"{excerpt.strip()}"
-        )
 
     email_body = (
-        "Vinnies Brain — Escalation\n"
+        "Vinnies Brain — Email Escalation\n"
         f"Session ID: {req.session_id}\n"
         f"Airstream year: {airstream_year if airstream_year is not None else ''}\n"
         f"Business hours at submit: {'YES' if open_now else 'NO'}\n\n"
@@ -2557,9 +2874,14 @@ def create_escalation(req: EscalationRequest):
         + (f"Email: {req.email}\n" if (req.email or '').strip() else "")
         + (f"Phone: {req.phone}\n" if (req.phone or '').strip() else "")
         + f"Preferred contact: {req.preferred_contact}\n\n"
-        "Issue summary\n"
-        + (req.message or "").strip()
-        + transcript_block
+        "Customer-entered issue\n"
+        + ((req.message or "").strip() or "(none)")
+        + "\n\n"
+        "AI conversation summary\n"
+        "-----------------------\n"
+        + (conversation_summary or "No AI summary was available.")
+        + "\n\n"
+        "Note: The full conversation is still saved in the admin AI history if more detail is needed."
     ).strip()
 
 
@@ -2830,6 +3152,22 @@ def admin_update_escalation(
             payload["handled_at"] = datetime.utcnow().isoformat()
 
     _ = sb_upsert("escalations", [payload], on_conflict="id")
+    return {"ok": True}
+
+
+
+@app.delete("/v1/admin/escalations/{escalation_id}")
+def admin_delete_escalation(
+    escalation_id: str,
+    x_admin_key: str = Header(default="", alias="X-Admin-Key"),
+):
+    require_admin(x_admin_key)
+
+    esc_id = (escalation_id or "").strip()
+    if not esc_id:
+        raise HTTPException(status_code=400, detail="Missing escalation_id")
+
+    _ = sb_delete("escalations", {"id": f"eq.{esc_id}"}, prefer="return=minimal")
     return {"ok": True}
 
 
