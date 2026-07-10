@@ -738,6 +738,10 @@ class ChatResponse(BaseModel):
     confidence: float
     used_articles: List[UsedArticle]
     show_escalation: bool
+    # True only when this assistant response is an actual troubleshooting/advice turn.
+    # Intake questions and greetings are False, so the app can show escalation after
+    # three real troubleshooting prompts instead of three total AI messages.
+    is_troubleshooting_response: bool = False
     message_id: str
 
 
@@ -1227,6 +1231,20 @@ def build_natural_intake_instruction(history: List[Dict[str, Any]], safety_flags
         "Keep the response short and conversational. "
         f"After about {remaining} more customer answer(s), move into troubleshooting steps based on what you learned. "
         f"{safety_note}"
+    ).strip()
+
+
+
+
+def build_concise_troubleshooting_instruction() -> str:
+    return (
+        "RESPONSE_STYLE_INSTRUCTION:\n"
+        "The customer is now past intake. Give concise troubleshooting help. "
+        "Keep the answer short: usually 2 to 4 brief bullet points or steps, no long explanations. "
+        "Start with the most likely and easiest check first. "
+        "Ask for only one result or observation at the end. "
+        "Do not include broad background, long checklists, or multiple possible branches unless safety requires it. "
+        "For urgent safety issues, give the shortest safe instruction first, then stop and recommend professional help if needed."
     ).strip()
 
 
@@ -1978,6 +1996,7 @@ def chat(req: ChatRequest):
                 confidence=0.7,
                 used_articles=[],
                 show_escalation=False,
+                is_troubleshooting_response=False,
                 message_id=message_id,
             )
 
@@ -1995,6 +2014,7 @@ def chat(req: ChatRequest):
                 confidence=0.4,
                 used_articles=[],
                 show_escalation=False,
+                is_troubleshooting_response=False,
                 message_id=message_id,
             )
 
@@ -2203,13 +2223,21 @@ def chat(req: ChatRequest):
     # Prepare rewritten_user_message again (we computed it inside DB phase, but keep it stable)
     rewritten_user_message = rewrite_short_answer(req.message, active_question_text)
 
+    # Keep troubleshooting answers short once intake is complete.
+    if not natural_intake_mode:
+        flow_instruction = build_concise_troubleshooting_instruction()
+
+    response_context = (
+        flow_instruction + "\n\n---\n\n" + "\n\n---\n\n".join(context_chunks)
+    ).strip() if flow_instruction else "\n\n---\n\n".join(context_chunks)
+
     # -------------------------
     # Phase 2: LLM call (NO DB HELD)
     # -------------------------
     try:
         answer, clarifying, confidence = generate_answer(
             user_message=rewritten_user_message,
-            context=(flow_instruction + "\n\n---\n\n" + "\n\n---\n\n".join(context_chunks)).strip() if flow_instruction else "\n\n---\n\n".join(context_chunks),
+            context=response_context,
             safety_flags=flags,
             airstream_year=year,
             category=category,
@@ -2288,6 +2316,7 @@ def chat(req: ChatRequest):
         confidence=confidence,
         used_articles=[UsedArticle(**a) for a in used_articles],
         show_escalation=not natural_intake_mode,
+        is_troubleshooting_response=not natural_intake_mode,
         message_id=message_id,
     )
 
