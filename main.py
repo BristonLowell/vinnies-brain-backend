@@ -1,6 +1,7 @@
 import os
 import uuid
 import json
+import re
 import traceback
 import logging
 import time
@@ -1229,6 +1230,7 @@ def build_natural_intake_instruction(history: List[Dict[str, Any]], safety_flags
         "Ask one or two natural follow-up questions that are specific to the customer's exact problem and prior answers. "
         "Do not use a canned or pre-formatted starter question. "
         "Keep the response short and conversational. "
+        "Use plain text only. Do not use markdown, asterisks, bold text markers, headings, or numbered lists. "
         f"After about {remaining} more customer answer(s), move into troubleshooting steps based on what you learned. "
         f"{safety_note}"
     ).strip()
@@ -1241,11 +1243,112 @@ def build_concise_troubleshooting_instruction() -> str:
         "RESPONSE_STYLE_INSTRUCTION:\n"
         "The customer is now past intake. Give concise troubleshooting help. "
         "Keep the answer short: usually 2 to 4 brief bullet points or steps, no long explanations. "
+        "Use plain text only. Do not use asterisks, markdown bold, heading labels, or long section titles. "
+        "If bullets are helpful, use short hyphen bullets only. "
+        "Do not include a What we know so far section. "
         "Start with the most likely and easiest check first. "
         "Ask for only one result or observation at the end. "
         "Do not include broad background, long checklists, or multiple possible branches unless safety requires it. "
         "For urgent safety issues, give the shortest safe instruction first, then stop and recommend professional help if needed."
     ).strip()
+
+
+def clean_ai_response_text(text: str) -> str:
+    """Remove markdown artifacts so the mobile chat reads cleanly as plain text."""
+    if not text:
+        return text
+
+    out = str(text).replace("**", "").replace("__", "")
+
+    cleaned_lines: List[str] = []
+    for raw in out.splitlines():
+        line = raw.rstrip()
+        stripped = line.lstrip()
+        prefix = line[: len(line) - len(stripped)]
+
+        # Convert markdown/star bullets to simple hyphen bullets.
+        if stripped.startswith("* "):
+            stripped = "- " + stripped[2:].strip()
+        elif stripped.startswith("• "):
+            stripped = "- " + stripped[2:].strip()
+
+        cleaned_lines.append(prefix + stripped)
+
+    out = "\n".join(cleaned_lines)
+    out = re.sub(r"\*+", "", out)
+    out = re.sub(r"[ \t]+\n", "\n", out)
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    return out.strip()
+
+
+def clean_clarifying_questions(questions: Any) -> List[str]:
+    if not isinstance(questions, list):
+        return []
+
+    cleaned: List[str] = []
+    for q in questions:
+        qs = clean_ai_response_text(str(q or ""))
+        if qs:
+            cleaned.append(qs)
+    return cleaned
+
+
+_TROUBLESHOOTING_ACTION_WORDS = (
+    "check", "try", "turn", "reset", "inspect", "look", "verify", "test",
+    "shut", "disconnect", "connect", "plug", "unplug", "tighten", "clean",
+    "open", "close", "measure", "press", "hold", "replace", "remove", "reinstall",
+    "switch", "confirm", "make sure", "look for", "listen for", "feel for",
+)
+
+
+def looks_like_troubleshooting_response(answer: str, natural_intake_mode: bool) -> bool:
+    """Return True only when the assistant actually gave troubleshooting/advice steps.
+
+    The resolved prompt and escalation counter should not advance on greetings,
+    intake questions, or question-only follow-ups. The LLM may still ask one
+    observation question at the end of a real troubleshooting answer, so we look
+    for action-oriented step content instead of simply checking for question marks.
+    """
+    if natural_intake_mode:
+        return False
+
+    text = (answer or "").strip()
+    if not text:
+        return False
+
+    lower = text.lower()
+    action_hit = any(word in lower for word in _TROUBLESHOOTING_ACTION_WORDS)
+    starts_with_action = any(
+        lower.lstrip().startswith(word + " ")
+        for word in _TROUBLESHOOTING_ACTION_WORDS
+        if " " not in word
+    )
+
+    stepish_lines = 0
+    for line in text.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        sl = s.lower()
+        if s.startswith(("-", "•", "*")) or (len(s) >= 2 and s[0].isdigit() and s[1:2] in {".", ")", ":"}):
+            if any(word in sl for word in _TROUBLESHOOTING_ACTION_WORDS):
+                stepish_lines += 1
+        elif sl.startswith(("step ", "try this", "do this", "next check")):
+            stepish_lines += 1
+
+    if stepish_lines >= 1 or starts_with_action:
+        return True
+
+    # A short reply that is mostly a question is still an intake/follow-up, not troubleshooting steps.
+    sentence_count = len([p for p in re.split(r"[.!?]+", text) if p.strip()])
+    if "?" in text and sentence_count <= 2 and len(text) < 220:
+        return False
+
+    # Plain-language advice without bullets can still be troubleshooting if it is action-oriented.
+    if action_hit:
+        return True
+
+    return False
 
 
 def first_question_from_response(answer: str, clarifying: List[str]) -> Optional[str]:
@@ -2248,6 +2351,10 @@ def chat(req: ChatRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"LLM error: {e}")
 
+    # Clean markdown artifacts before storing or showing the answer.
+    answer = clean_ai_response_text(answer)
+    clarifying = clean_clarifying_questions(clarifying)
+
     # Subtle check-in (only when from_kb)
     if not natural_intake_mode:
         answer = maybe_append_subtle_checkin(
@@ -2257,21 +2364,14 @@ def chat(req: ChatRequest):
             from_kb=from_kb,
             history=history,
         )
+        answer = clean_ai_response_text(answer)
 
-    # Checkpoint summary (every 3 assistant messages per your code)
+    # True only when this answer actually contains troubleshooting/advice steps.
+    # Do not show the resolved prompt after question-only follow-ups.
+    is_troubleshooting_response = looks_like_troubleshooting_response(answer, natural_intake_mode)
+
+    # Checkpoint summaries are disabled; the app no longer shows the "What we know so far" card.
     checkpoint_summary = None
-    try:
-        assistant_count = sum(
-            1 for h in (history or []) if (h.get("role") or "").strip().lower() == "assistant"
-        )
-        if (assistant_count + 1) % 3 == 0:
-            checkpoint_summary = generate_checkpoint_summary(
-                history=history,
-                airstream_year=year,
-                category=category,
-            )
-    except Exception:
-        checkpoint_summary = None
 
     # Store last asked question (without ** wrappers)
     if aq_supported:
@@ -2315,8 +2415,8 @@ def chat(req: ChatRequest):
         safety_flags=flags,
         confidence=confidence,
         used_articles=[UsedArticle(**a) for a in used_articles],
-        show_escalation=not natural_intake_mode,
-        is_troubleshooting_response=not natural_intake_mode,
+        show_escalation=is_troubleshooting_response,
+        is_troubleshooting_response=is_troubleshooting_response,
         message_id=message_id,
     )
 
