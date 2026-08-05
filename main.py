@@ -332,6 +332,14 @@ OPENAI_ESCALATION_SUMMARY_MODEL = os.getenv(
     os.getenv("OPENAI_SUMMARY_MODEL", "gpt-4o-mini"),
 ).strip()
 
+# Used to generate short, question-specific quick-reply buttons during intake.
+# This is a separate small call so the existing openai_client response contract
+# does not need to change.
+OPENAI_ANSWER_CHOICES_MODEL = os.getenv(
+    "OPENAI_ANSWER_CHOICES_MODEL",
+    os.getenv("OPENAI_SUMMARY_MODEL", "gpt-4o-mini"),
+).strip()
+
 def send_escalation_email(to_email: str, subject: str, body: str) -> bool:
     """Best-effort Gmail SMTP send.
 
@@ -1028,6 +1036,9 @@ class ChatResponse(BaseModel):
     answer: str
     checkpoint_summary: Optional[CheckpointSummary] = None
     clarifying_questions: List[str]
+    # Two or three AI-generated quick replies for question-only/intake responses.
+    # The mobile app adds “I’m not sure” itself.
+    answer_choices: List[str] = Field(default_factory=list)
     safety_flags: List[str]
     confidence: float
     used_articles: List[UsedArticle]
@@ -1520,7 +1531,7 @@ def build_natural_intake_instruction(history: List[Dict[str, Any]], safety_flags
         "CONVERSATION_FLOW_INSTRUCTION:\n"
         "The customer is still in the intake/question phase. Do not give troubleshooting steps yet. "
         "Do not provide a diagnosis, repair advice, numbered steps, or a checklist yet. "
-        "Ask one or two natural follow-up questions that are specific to the customer's exact problem and prior answers. "
+        "Ask exactly one natural follow-up question that is specific to the customer's exact problem and prior answers. "
         "Do not use a canned or pre-formatted starter question. "
         "Keep the response short and conversational. "
         "Use plain text only. Do not use markdown, asterisks, bold text markers, headings, or numbered lists. "
@@ -1584,6 +1595,119 @@ def clean_clarifying_questions(questions: Any) -> List[str]:
         if qs:
             cleaned.append(qs)
     return cleaned
+
+
+def clean_answer_choices(choices: Any) -> List[str]:
+    """Validate AI-generated quick replies before returning them to the app."""
+    if not isinstance(choices, list):
+        return []
+
+    cleaned: List[str] = []
+    seen: Set[str] = set()
+
+    for value in choices:
+        choice = clean_ai_response_text(str(value or ""))
+        choice = re.sub(r"\s+", " ", choice).strip(" -•\t\r\n")
+        if not choice:
+            continue
+
+        # The client always adds this option itself.
+        normalized = choice.lower().replace("’", "'")
+        if normalized in {
+            "i'm not sure",
+            "im not sure",
+            "not sure",
+            "unsure",
+            "something else",
+            "other",
+        }:
+            continue
+
+        # Buttons should be short and should answer rather than ask another question.
+        if "?" in choice:
+            continue
+        if len(choice) > 70:
+            choice = choice[:67].rstrip() + "…"
+
+        key = choice.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(choice)
+
+        if len(cleaned) >= 3:
+            break
+
+    # One lone generated option is not useful; fall back to normal typing.
+    return cleaned if len(cleaned) >= 2 else []
+
+
+def generate_dynamic_answer_choices(
+    *,
+    question: str,
+    history: List[Dict[str, Any]],
+    current_user_message: str,
+    airstream_year: Optional[int],
+    category: Optional[str],
+) -> List[str]:
+    """Generate 2–3 concise replies tailored to the assistant's exact question.
+
+    This only runs for question-only/intake responses. Failures return an empty
+    list so the mobile app simply keeps the normal text box available.
+    """
+    question = clean_ai_response_text(question)
+    if not question or OpenAI is None:
+        return []
+
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        return []
+
+    recent_history = format_transcript((history or [])[-10:], max_chars=4500)
+
+    try:
+        client = OpenAI(api_key=api_key)  # type: ignore[operator]
+        resp = client.chat.completions.create(
+            model=OPENAI_ANSWER_CHOICES_MODEL or "gpt-4o-mini",
+            temperature=0.2,
+            max_tokens=140,
+            response_format={"type": "json_object"},
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You create quick-reply buttons for an Airstream troubleshooting app. "
+                        "Return JSON only with this shape: "
+                        '{"answer_choices":["choice 1","choice 2","choice 3"]}. '
+                        "Generate 2 or 3 short, likely answers that directly answer the exact question. "
+                        "Keep each choice under 9 words, make choices meaningfully different, and use customer-friendly wording. "
+                        "Do not include 'I'm not sure', 'Other', or 'Something else'; the app adds those controls. "
+                        "Do not give repair advice, diagnoses, warnings, or another question. "
+                        "If useful predefined answers are not possible, return an empty answer_choices array."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Airstream year: {airstream_year if airstream_year is not None else 'unknown'}\n"
+                        f"Category: {category or 'unknown'}\n"
+                        f"Customer's latest message: {current_user_message or '(none)'}\n\n"
+                        f"Recent conversation:\n{recent_history or '(none)'}\n\n"
+                        f"Exact assistant question:\n{question}"
+                    ),
+                },
+            ],
+        )
+
+        raw = (resp.choices[0].message.content or "").strip()
+        if not raw:
+            return []
+
+        data = json.loads(raw)
+        return clean_answer_choices(data.get("answer_choices"))
+    except Exception as e:
+        logger.warning("Quick-reply generation failed: %s", e)
+        return []
 
 
 _TROUBLESHOOTING_ACTION_WORDS = (
@@ -2692,19 +2816,31 @@ def chat(req: ChatRequest):
     # Do not show the resolved prompt after question-only follow-ups.
     is_troubleshooting_response = looks_like_troubleshooting_response(answer, natural_intake_mode)
 
+    # Find the single question the quick replies should answer. This works whether
+    # the model placed it in `answer` or `clarifying_questions`.
+    response_question = first_question_from_response(answer, clarifying)
+
+    answer_choices: List[str] = []
+    should_offer_answer_choices = natural_intake_mode or bool(clarifying)
+    if not is_troubleshooting_response and response_question and should_offer_answer_choices:
+        answer_choices = generate_dynamic_answer_choices(
+            question=response_question,
+            history=history,
+            current_user_message=req.message,
+            airstream_year=year,
+            category=category,
+        )
+
     # Checkpoint summaries are disabled; the app no longer shows the "What we know so far" card.
     checkpoint_summary = None
 
     # Store last asked question (without ** wrappers)
     if aq_supported:
-        if natural_intake_mode:
-            q_to_store = first_question_from_response(answer, clarifying)
-        else:
-            q_to_store = (clarifying[0] if (isinstance(clarifying, list) and len(clarifying) > 0) else "").strip()
-            if q_to_store.startswith("**") and q_to_store.endswith("**") and len(q_to_store) > 4:
-                q_to_store = q_to_store[2:-2].strip()
-            if not q_to_store:
-                q_to_store = None
+        q_to_store = response_question
+        if q_to_store and q_to_store.startswith("**") and q_to_store.endswith("**") and len(q_to_store) > 4:
+            q_to_store = q_to_store[2:-2].strip()
+        if not q_to_store:
+            q_to_store = None
 
     # -------------------------
     # Phase 3: DB WRITE (fast)
@@ -2734,6 +2870,7 @@ def chat(req: ChatRequest):
         answer=answer,
         checkpoint_summary=CheckpointSummary(**checkpoint_summary) if isinstance(checkpoint_summary, dict) else None,
         clarifying_questions=clarifying,
+        answer_choices=answer_choices,
         safety_flags=flags,
         confidence=confidence,
         used_articles=[UsedArticle(**a) for a in used_articles],
