@@ -1036,6 +1036,9 @@ class ChatResponse(BaseModel):
     answer: str
     checkpoint_summary: Optional[CheckpointSummary] = None
     clarifying_questions: List[str]
+    # False means the backend did not obtain relevant Supabase knowledge, so the
+    # mobile app must not display an AI answer for this turn.
+    knowledge_ready: bool = True
     # Two or three AI-generated quick replies for question-only/intake responses.
     # The mobile app adds “I’m not sure” itself.
     answer_choices: List[str] = Field(default_factory=list)
@@ -1105,7 +1108,7 @@ class AdminArticleRequest(BaseModel):
     category: str = "General"
     severity: str = "Medium"
     years_min: int = 2010
-    years_max: int = 2025
+    years_max: int = 2026
 
     customer_summary: str
 
@@ -1120,6 +1123,25 @@ class AdminArticleRequest(BaseModel):
     decision_tree: Optional[Dict[str, Any]] = None  # jsonb
 
 
+class AdminFactRequest(BaseModel):
+    fact_text: str
+    category: str = "General"
+    years_min: Optional[int] = Field(default=2010, ge=1900, le=2100)
+    years_max: Optional[int] = Field(default=2026, ge=1900, le=2100)
+    keywords: str = ""
+
+
+class AdminFactResponse(BaseModel):
+    id: str
+    fact_text: str
+    category: str = "General"
+    years_min: Optional[int] = None
+    years_max: Optional[int] = None
+    keywords: str = ""
+    created_at: Optional[Any] = None
+    updated_at: Optional[Any] = None
+
+
 # NEW (login-ready): claim guest sessions after login
 class ClaimSessionsRequest(BaseModel):
     session_ids: List[str] = Field(default_factory=list)
@@ -1131,22 +1153,107 @@ class ClaimSessionsRequest(BaseModel):
 END_TARGETS = {"end_done", "end_escalate", "end_not_applicable"}
 
 
-def get_relevant_facts(conn, year: int | None, user_message: str):
-    cur = conn.cursor()
+def get_relevant_facts(conn, year: int | None, user_message: str) -> List[str]:
+    """Load the most relevant authoritative facts from kb_facts.
 
-    cur.execute("""
-        select fact_text
-        from kb_facts
-        where
-            (years_min is null or years_min <= %s)
-        and
-            (years_max is null or years_max >= %s)
-        order by created_at desc
-        limit 10
-    """, (year, year))
+    Facts are filtered by model year and ranked by overlap with the customer's
+    wording plus any admin-provided category/keyword hints. The returned value is
+    still just fact_text so the OpenAI client receives a clean authoritative list.
+    """
+    with conn.cursor() as cur:
+        if year is None:
+            cur.execute(
+                """
+                SELECT fact_text,
+                       COALESCE(category, '') AS category,
+                       COALESCE(keywords, '') AS keywords
+                  FROM kb_facts
+                 ORDER BY created_at DESC
+                 LIMIT 100
+                """
+            )
+        else:
+            cur.execute(
+                """
+                SELECT fact_text,
+                       COALESCE(category, '') AS category,
+                       COALESCE(keywords, '') AS keywords
+                  FROM kb_facts
+                 WHERE (years_min IS NULL OR years_min <= %s)
+                   AND (years_max IS NULL OR years_max >= %s)
+                 ORDER BY created_at DESC
+                 LIMIT 100
+                """,
+                (year, year),
+            )
+        rows = cur.fetchall()
 
-    rows = cur.fetchall()
-    return [r[0] for r in rows]
+    stop_words = {
+        "about", "after", "again", "airstream", "because", "could", "does",
+        "from", "have", "into", "just", "like", "that", "their", "there",
+        "these", "they", "this", "trailer", "what", "when", "where", "which",
+        "with", "would", "your", "youre", "issue", "problem",
+    }
+    tokens = {
+        t for t in re.findall(r"[a-z0-9]+", (user_message or "").lower())
+        if len(t) >= 3 and t not in stop_words
+    }
+
+    candidates: List[Tuple[int, str]] = []
+    fallback: List[str] = []
+
+    for row in rows or []:
+        if isinstance(row, dict):
+            fact = str(row.get("fact_text") or "").strip()
+            category = str(row.get("category") or "").strip()
+            keywords = str(row.get("keywords") or "").strip()
+        else:
+            try:
+                fact = str(row[0] or "").strip()
+                category = str(row[1] or "").strip()
+                keywords = str(row[2] or "").strip()
+            except Exception:
+                continue
+
+        if not fact:
+            continue
+        fallback.append(fact)
+
+        searchable = f"{fact} {category} {keywords}".lower()
+        searchable_tokens = set(re.findall(r"[a-z0-9]+", searchable))
+        overlap = len(tokens & searchable_tokens)
+
+        # Exact keyword phrases get a small extra boost.
+        phrase_boost = 0
+        for kw in re.split(r"[,;|]", keywords):
+            kw = kw.strip().lower()
+            if kw and kw in (user_message or "").lower():
+                phrase_boost += 2
+
+        score = overlap + phrase_boost
+        if score > 0:
+            candidates.append((score, fact))
+
+    if candidates:
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        seen: Set[str] = set()
+        out: List[str] = []
+        for _, fact in candidates:
+            key = fact.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(fact)
+            if len(out) >= 10:
+                break
+        return out
+
+    # For very short/generic questions there may be no useful tokens. Supplying a
+    # small set of newest year-compatible facts is safer than dropping all facts.
+    if not tokens:
+        return fallback[:10]
+
+    return []
 
 
 def _dt_get_nodes(tree: Dict[str, Any]) -> Dict[str, Any]:
@@ -1532,8 +1639,9 @@ def build_natural_intake_instruction(history: List[Dict[str, Any]], safety_flags
         "The customer is still in the intake/question phase. Do not give troubleshooting steps yet. "
         "Do not provide a diagnosis, repair advice, numbered steps, or a checklist yet. "
         "Ask exactly one natural follow-up question that is specific to the customer's exact problem and prior answers. "
+        "For this intake turn, output ONLY that question. Do not add an explanation, summary, likely cause, preamble, or troubleshooting advice before or after it. "
         "Do not use a canned or pre-formatted starter question. "
-        "Keep the response short and conversational. "
+        "Keep the question short and conversational. "
         "Use plain text only. Do not use markdown, asterisks, bold text markers, headings, or numbered lists. "
         f"After about {remaining} more customer answer(s), move into troubleshooting steps based on what you learned. "
         f"{safety_note}"
@@ -1597,13 +1705,57 @@ def clean_clarifying_questions(questions: Any) -> List[str]:
     return cleaned
 
 
+def _normalize_choice_for_similarity(choice: str) -> str:
+    text = (choice or "").lower().replace("’", "'")
+    text = re.sub(r"[^a-z0-9\s']+", " ", text)
+
+    # Remove filler words that commonly make synonymous buttons look different.
+    stop_words = {
+        "a", "an", "and", "at", "during", "for", "happen", "happens",
+        "i", "in", "it", "mainly", "mostly", "my", "of", "on", "only",
+        "the", "to", "usually", "when", "while", "with",
+    }
+    tokens: List[str] = []
+    for token in text.split():
+        if token in stop_words:
+            continue
+        # Small normalization for common wording variants.
+        aliases = {
+            "raining": "rain", "rains": "rain", "rainy": "rain",
+            "driving": "travel", "drive": "travel", "traveling": "travel",
+            "travelling": "travel", "washed": "wash", "washing": "wash",
+            "constantly": "always", "continuous": "always", "continuously": "always",
+        }
+        token = aliases.get(token, token)
+        tokens.append(token)
+    return " ".join(tokens).strip()
+
+
+def _choices_too_similar(a: str, b: str) -> bool:
+    na = _normalize_choice_for_similarity(a)
+    nb = _normalize_choice_for_similarity(b)
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+    if min(len(na), len(nb)) >= 5 and (na in nb or nb in na):
+        return True
+
+    ta = set(na.split())
+    tb = set(nb.split())
+    if ta and tb:
+        overlap = len(ta & tb) / max(1, min(len(ta), len(tb)))
+        if overlap >= 0.8:
+            return True
+    return False
+
+
 def clean_answer_choices(choices: Any) -> List[str]:
-    """Validate AI-generated quick replies before returning them to the app."""
+    """Validate and semantically de-duplicate AI-generated quick replies."""
     if not isinstance(choices, list):
         return []
 
     cleaned: List[str] = []
-    seen: Set[str] = set()
 
     for value in choices:
         choice = clean_ai_response_text(str(value or ""))
@@ -1611,7 +1763,6 @@ def clean_answer_choices(choices: Any) -> List[str]:
         if not choice:
             continue
 
-        # The client always adds this option itself.
         normalized = choice.lower().replace("’", "'")
         if normalized in {
             "i'm not sure",
@@ -1623,24 +1774,23 @@ def clean_answer_choices(choices: Any) -> List[str]:
         }:
             continue
 
-        # Buttons should be short and should answer rather than ask another question.
+        # Buttons should answer the question, not ask another one.
         if "?" in choice:
             continue
-        if len(choice) > 70:
-            choice = choice[:67].rstrip() + "…"
+        if len(choice) > 64:
+            choice = choice[:61].rstrip() + "…"
 
-        key = choice.casefold()
-        if key in seen:
+        # Reject exact AND meaningfully similar duplicates.
+        if any(_choices_too_similar(choice, existing) for existing in cleaned):
             continue
-        seen.add(key)
-        cleaned.append(choice)
 
+        cleaned.append(choice)
         if len(cleaned) >= 3:
             break
 
-    # One lone generated option is not useful; fall back to normal typing.
+    # If de-duplication leaves fewer than two useful branches, do not show
+    # buttons at all; the normal text box is safer than bad choices.
     return cleaned if len(cleaned) >= 2 else []
-
 
 def generate_dynamic_answer_choices(
     *,
@@ -1649,6 +1799,7 @@ def generate_dynamic_answer_choices(
     current_user_message: str,
     airstream_year: Optional[int],
     category: Optional[str],
+    knowledge_context: str,
 ) -> List[str]:
     """Generate 2–3 concise replies tailored to the assistant's exact question.
 
@@ -1664,12 +1815,17 @@ def generate_dynamic_answer_choices(
         return []
 
     recent_history = format_transcript((history or [])[-10:], max_chars=4500)
+    grounded_context = (knowledge_context or "").strip()[:7000]
+    if not grounded_context:
+        # Never invent button choices without the same Supabase knowledge that
+        # grounded the clarifying question.
+        return []
 
     try:
         client = OpenAI(api_key=api_key)  # type: ignore[operator]
         resp = client.chat.completions.create(
             model=OPENAI_ANSWER_CHOICES_MODEL or "gpt-4o-mini",
-            temperature=0.2,
+            temperature=0.0,
             max_tokens=140,
             response_format={"type": "json_object"},
             messages=[
@@ -1679,11 +1835,15 @@ def generate_dynamic_answer_choices(
                         "You create quick-reply buttons for an Airstream troubleshooting app. "
                         "Return JSON only with this shape: "
                         '{"answer_choices":["choice 1","choice 2","choice 3"]}. '
-                        "Generate 2 or 3 short, likely answers that directly answer the exact question. "
-                        "Keep each choice under 9 words, make choices meaningfully different, and use customer-friendly wording. "
+                        "Generate 2 or 3 short answers that directly answer the exact question. "
+                        "The choices must represent genuinely different branches, not synonyms, rephrasings, or overlapping versions of the same answer. "
+                        "For a yes/no question, prefer simple Yes and No choices unless the question clearly needs distinct qualified states. "
+                        "For where/when/how-often questions, use mutually distinct categories. "
+                        "Ground the choices in the supplied Supabase knowledge and conversation; do not invent model-specific facts or unsupported conditions. "
+                        "Keep each choice under 9 words and use customer-friendly wording. "
                         "Do not include 'I'm not sure', 'Other', or 'Something else'; the app adds those controls. "
                         "Do not give repair advice, diagnoses, warnings, or another question. "
-                        "If useful predefined answers are not possible, return an empty answer_choices array."
+                        "If you cannot produce at least two clearly different, sensible choices, return an empty answer_choices array."
                     ),
                 },
                 {
@@ -1693,6 +1853,7 @@ def generate_dynamic_answer_choices(
                         f"Category: {category or 'unknown'}\n"
                         f"Customer's latest message: {current_user_message or '(none)'}\n\n"
                         f"Recent conversation:\n{recent_history or '(none)'}\n\n"
+                        f"Supabase knowledge for this issue:\n{grounded_context}\n\n"
                         f"Exact assistant question:\n{question}"
                     ),
                 },
@@ -2208,10 +2369,53 @@ def ensure_escalations_table(conn):
     )
 
 
+def ensure_kb_facts_table(conn):
+    """Create/upgrade the lightweight authoritative-facts table used by chat."""
+    exec_no_return(
+        conn,
+        """
+        CREATE TABLE IF NOT EXISTS kb_facts (
+          id TEXT,
+          fact_text TEXT NOT NULL,
+          years_min INTEGER,
+          years_max INTEGER,
+          category TEXT DEFAULT 'General',
+          keywords TEXT DEFAULT '',
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+    )
+
+    # Existing deployments may already have a smaller kb_facts table.
+    for statement in [
+        "ALTER TABLE kb_facts ADD COLUMN IF NOT EXISTS id TEXT",
+        "ALTER TABLE kb_facts ADD COLUMN IF NOT EXISTS category TEXT DEFAULT 'General'",
+        "ALTER TABLE kb_facts ADD COLUMN IF NOT EXISTS keywords TEXT DEFAULT ''",
+        "ALTER TABLE kb_facts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+    ]:
+        exec_no_return(conn, statement)
+
+    # Give older rows stable ids so they can be edited/deleted from the Admin UI.
+    exec_no_return(
+        conn,
+        """
+        UPDATE kb_facts
+           SET id = md5(random()::text || clock_timestamp()::text || fact_text)
+         WHERE id IS NULL OR BTRIM(id) = ''
+        """,
+    )
+    exec_no_return(
+        conn,
+        "CREATE UNIQUE INDEX IF NOT EXISTS kb_facts_id_uidx ON kb_facts(id)",
+    )
+
+
 @app.on_event("startup")
 def _startup():
     with db() as conn:
         ensure_escalations_table(conn)
+        ensure_kb_facts_table(conn)
         conn.commit()
 
 
@@ -2769,6 +2973,32 @@ def chat(req: ChatRequest):
                         )
                         conn.commit()
 
+    # HARD GROUNDING GATE: do not call the answer model until relevant
+    # troubleshooting knowledge has actually been loaded from Supabase/Postgres.
+    # This prevents the first AI turn from answering from generic model knowledge
+    # while retrieval is empty or failed.
+    knowledge_ready = bool(context_chunks or authoritative_facts)
+    if not knowledge_ready:
+        logger.warning(
+            "No Supabase knowledge available for chat turn session=%s year=%s category=%s",
+            req.session_id,
+            year,
+            category,
+        )
+        return ChatResponse(
+            answer="",
+            checkpoint_summary=None,
+            clarifying_questions=[],
+            knowledge_ready=False,
+            answer_choices=[],
+            safety_flags=flags,
+            confidence=0.0,
+            used_articles=[],
+            show_escalation=False,
+            is_troubleshooting_response=False,
+            message_id=message_id,
+        )
+
     # Prepare rewritten_user_message again (we computed it inside DB phase, but keep it stable)
     rewritten_user_message = rewrite_short_answer(req.message, active_question_text)
 
@@ -2793,6 +3023,7 @@ def chat(req: ChatRequest):
             history=history,
             pending_question=pending_q or None,
             authoritative_facts=authoritative_facts,
+            intake_only=natural_intake_mode,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"LLM error: {e}")
@@ -2800,6 +3031,13 @@ def chat(req: ChatRequest):
     # Clean markdown artifacts before storing or showing the answer.
     answer = clean_ai_response_text(answer)
     clarifying = clean_clarifying_questions(clarifying)
+
+    # Intake turns are question-only in the customer UI. Even if the model
+    # returns explanatory text, discard it and keep only the single question.
+    intake_question = first_question_from_response(answer, clarifying) if natural_intake_mode else None
+    if natural_intake_mode:
+        answer = clean_ai_response_text(intake_question or "")
+        clarifying = []
 
     # Subtle check-in (only when from_kb)
     if not natural_intake_mode:
@@ -2829,6 +3067,7 @@ def chat(req: ChatRequest):
             current_user_message=req.message,
             airstream_year=year,
             category=category,
+            knowledge_context="\n\n---\n\n".join(context_chunks),
         )
 
     # Checkpoint summaries are disabled; the app no longer shows the "What we know so far" card.
@@ -2870,6 +3109,7 @@ def chat(req: ChatRequest):
         answer=answer,
         checkpoint_summary=CheckpointSummary(**checkpoint_summary) if isinstance(checkpoint_summary, dict) else None,
         clarifying_questions=clarifying,
+        knowledge_ready=True,
         answer_choices=answer_choices,
         safety_flags=flags,
         confidence=confidence,
@@ -3214,6 +3454,119 @@ def livechat_history(session_id: str):
         },
     )
     return {"conversation_id": conv_id, "messages": rows or []}
+
+
+
+@app.get("/v1/admin/facts")
+def admin_list_facts(x_admin_key: str = Header(default="", alias="X-Admin-Key")):
+    require_admin(x_admin_key)
+
+    with db() as conn:
+        ensure_kb_facts_table(conn)
+        rows = exec_all(
+            conn,
+            """
+            SELECT id, fact_text, category, years_min, years_max, keywords, created_at, updated_at
+              FROM kb_facts
+             ORDER BY updated_at DESC NULLS LAST, created_at DESC
+             LIMIT 300
+            """,
+            (),
+        )
+        conn.commit()
+
+    return {"facts": rows or []}
+
+
+@app.post("/v1/admin/facts", response_model=AdminFactResponse)
+def admin_create_fact(req: AdminFactRequest, x_admin_key: str = Header(default="", alias="X-Admin-Key")):
+    require_admin(x_admin_key)
+
+    fact_text = (req.fact_text or "").strip()
+    category = (req.category or "General").strip() or "General"
+    keywords = (req.keywords or "").strip()
+
+    if not fact_text:
+        raise HTTPException(status_code=400, detail="Fact text is required.")
+    if req.years_min is not None and req.years_max is not None and req.years_min > req.years_max:
+        raise HTTPException(status_code=400, detail="years_min cannot be greater than years_max.")
+
+    fact_id = str(uuid.uuid4())
+    with db() as conn:
+        ensure_kb_facts_table(conn)
+        row = exec_one(
+            conn,
+            """
+            INSERT INTO kb_facts
+                (id, fact_text, category, years_min, years_max, keywords, created_at, updated_at)
+            VALUES
+                (%s, %s, %s, %s, %s, %s, NOW(), NOW())
+            RETURNING id, fact_text, category, years_min, years_max, keywords, created_at, updated_at
+            """,
+            (fact_id, fact_text, category, req.years_min, req.years_max, keywords),
+        )
+        conn.commit()
+
+    return AdminFactResponse(**row)
+
+
+@app.put("/v1/admin/facts/{fact_id}", response_model=AdminFactResponse)
+def admin_update_fact(
+    fact_id: str,
+    req: AdminFactRequest,
+    x_admin_key: str = Header(default="", alias="X-Admin-Key"),
+):
+    require_admin(x_admin_key)
+
+    fact_text = (req.fact_text or "").strip()
+    category = (req.category or "General").strip() or "General"
+    keywords = (req.keywords or "").strip()
+
+    if not fact_text:
+        raise HTTPException(status_code=400, detail="Fact text is required.")
+    if req.years_min is not None and req.years_max is not None and req.years_min > req.years_max:
+        raise HTTPException(status_code=400, detail="years_min cannot be greater than years_max.")
+
+    with db() as conn:
+        ensure_kb_facts_table(conn)
+        row = exec_one(
+            conn,
+            """
+            UPDATE kb_facts
+               SET fact_text=%s,
+                   category=%s,
+                   years_min=%s,
+                   years_max=%s,
+                   keywords=%s,
+                   updated_at=NOW()
+             WHERE id=%s
+         RETURNING id, fact_text, category, years_min, years_max, keywords, created_at, updated_at
+            """,
+            (fact_text, category, req.years_min, req.years_max, keywords, fact_id),
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="Fact not found.")
+        conn.commit()
+
+    return AdminFactResponse(**row)
+
+
+@app.delete("/v1/admin/facts/{fact_id}")
+def admin_delete_fact(fact_id: str, x_admin_key: str = Header(default="", alias="X-Admin-Key")):
+    require_admin(x_admin_key)
+
+    with db() as conn:
+        ensure_kb_facts_table(conn)
+        row = exec_one(
+            conn,
+            "DELETE FROM kb_facts WHERE id=%s RETURNING id",
+            (fact_id,),
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="Fact not found.")
+        conn.commit()
+
+    return {"ok": True, "id": fact_id}
 
 
 @app.post("/v1/admin/articles")

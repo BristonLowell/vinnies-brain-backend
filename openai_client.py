@@ -173,6 +173,7 @@ def generate_answer(
     history: Optional[List[Dict[str, Any]]] = None,
     pending_question: Optional[str] = None,
     authoritative_facts: Optional[List[str]] = None,
+    intake_only: bool = False,
 ) -> Tuple[str, List[str], float]:
     """
     Matches what main.py expects:
@@ -218,7 +219,7 @@ CONTEXT ANCHOR:
 CRITICAL FORMAT RULE (UI requirement):
 - NEVER put the clarifying question in the "answer" text.
 - If a question is required, put it ONLY in "clarifying_questions".
-- The "answer" must contain explanation / likely causes / next steps — but NO question.
+- Outside intake mode, the "answer" may contain explanation / likely causes / next steps, but NO question.
 
 Core behavior:
 - Speak like Vinnie: an experienced Airstream tech (practical, confident, no fluff).
@@ -242,6 +243,17 @@ Return STRICT JSON:
   "clarifying_questions": string[],
   "confidence": number
 }}
+""".strip()
+
+    if intake_only:
+        system_instructions += "\n\n" + """
+INTAKE MODE (HARD UI RULE):
+- This is an intake/clarifying turn, not a troubleshooting turn.
+- Return exactly ONE clarifying question.
+- Put that question only in clarifying_questions.
+- Set answer to an empty string.
+- Do NOT explain, summarize, diagnose, mention likely causes, give advice, apologize, or add a preamble.
+- The customer-facing output for this turn must be the question only.
 """.strip()
 
     kb_block = (context or "").strip()
@@ -314,7 +326,7 @@ Return STRICT JSON:
         except Exception:
             answer = out_text
 
-    if not answer:
+    if not answer and not (intake_only and clarifying):
         chunks: List[str] = []
         for item in getattr(resp, "output", []) or []:
             for c in getattr(item, "content", []) or []:
@@ -324,6 +336,17 @@ Return STRICT JSON:
         answer = "\n".join(chunks).strip() or "Sorry — I couldn’t generate a response."
 
     answer = _strip_question_lines_from_answer(answer)
+
+    if intake_only:
+        # Hard server-side cleanup: even if the model ignores the prompt, intake
+        # turns must never include explanatory text. Recover one question if
+        # possible, then blank the answer completely.
+        if not clarifying:
+            recovered = _extract_questions_from_text(answer or out_text)
+            if recovered:
+                clarifying = [recovered[0]]
+        clarifying = clarifying[:1]
+        answer = ""
 
     if clarifying:
         q = clarifying[0].strip()
