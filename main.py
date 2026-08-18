@@ -277,16 +277,26 @@ def run_db_transaction(fn, attempts: int = 2):
 # Telemetry (optional)
 # -------------------------
 def _telemetry_insert(conn, session_id: str, event_type: str, payload: Optional[Dict[str, Any]] = None) -> None:
-    """Best-effort telemetry. Will not raise if table doesn't exist."""
+    """Best-effort telemetry that cannot poison the surrounding DB transaction."""
     payload = payload or {}
     try:
-        exec_no_return(
-            conn,
-            "INSERT INTO telemetry_events (session_id, event_type, payload) VALUES (%s, %s, %s)",
-            (session_id, event_type, json.dumps(payload)),
+        # db() starts a transaction because it uses SET LOCAL. A nested
+        # conn.transaction() therefore creates a SAVEPOINT. If telemetry fails
+        # (missing table/schema mismatch/etc.), psycopg rolls back only to this
+        # savepoint instead of leaving the whole /v1/chat transaction aborted.
+        with conn.transaction():
+            exec_no_return(
+                conn,
+                "INSERT INTO telemetry_events (session_id, event_type, payload) VALUES (%s, %s, %s)",
+                (session_id, event_type, json.dumps(payload)),
+            )
+    except Exception as e:
+        logger.warning(
+            "Telemetry insert failed session=%s event=%s error=%s",
+            session_id,
+            event_type,
+            e,
         )
-    except Exception:
-        return
 
 
 
@@ -2814,10 +2824,21 @@ def chat(req: ChatRequest):
 
         use_pinned = bool(pin_supported and active_article_id and isinstance(active_tree, dict) and active_node_id and yn)
 
-        # 🔥 Fetch authoritative micro-facts from DB (fast)
+        # Fetch authoritative micro-facts from DB (fast).
+        # This lookup is optional, so isolate it with a SAVEPOINT. Previously an
+        # error here was swallowed, but PostgreSQL left the transaction aborted;
+        # the very next keyword_kb_articles() query then failed with
+        # InFailedSqlTransaction.
         try:
-            authoritative_facts = get_relevant_facts(conn, year, req.message)
-        except Exception:
+            with conn.transaction():
+                authoritative_facts = get_relevant_facts(conn, year, req.message)
+        except Exception as e:
+            logger.warning(
+                "Authoritative facts lookup failed session=%s year=%s error=%s",
+                req.session_id,
+                year,
+                e,
+            )
             authoritative_facts = []
 
         # Step B: compute pending_q from the last stored assistant question
@@ -2869,8 +2890,21 @@ def chat(req: ChatRequest):
             conn.commit()
 
         else:
-            # Keyword search first (no OpenAI embedding)
-            ranked = keyword_kb_articles(conn, req.message, year, category, top_k=6)
+            # Keyword search first (no OpenAI embedding). Keep retrieval failures
+            # from aborting the whole request; if keyword retrieval is unavailable
+            # we can still fall back to vector search below.
+            try:
+                with conn.transaction():
+                    ranked = keyword_kb_articles(conn, req.message, year, category, top_k=6)
+            except Exception as e:
+                logger.warning(
+                    "Keyword KB lookup failed session=%s year=%s category=%s error=%s",
+                    req.session_id,
+                    year,
+                    category,
+                    e,
+                )
+                ranked = []
 
             if ranked:
                 for r, score in ranked:
@@ -2943,7 +2977,18 @@ def chat(req: ChatRequest):
 
         if q_emb:
             with db() as conn:
-                ranked2 = rank_kb_articles(conn, q_emb, year, category, top_k=6)
+                try:
+                    with conn.transaction():
+                        ranked2 = rank_kb_articles(conn, q_emb, year, category, top_k=6)
+                except Exception as e:
+                    logger.warning(
+                        "Vector KB lookup failed session=%s year=%s category=%s error=%s",
+                        req.session_id,
+                        year,
+                        category,
+                        e,
+                    )
+                    ranked2 = []
 
                 for r, score in ranked2:
                     if score < 0.15:
