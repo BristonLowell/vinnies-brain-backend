@@ -2370,12 +2370,16 @@ def ensure_escalations_table(conn):
 
 
 def ensure_kb_facts_table(conn):
-    """Create/upgrade the lightweight authoritative-facts table used by chat."""
+    """Create/upgrade the lightweight authoritative-facts table used by chat.
+
+    kb_facts.id is UUID in the existing Supabase schema. Keep it UUID so startup
+    migrations, admin CRUD, and existing rows all use the same type.
+    """
     exec_no_return(
         conn,
         """
         CREATE TABLE IF NOT EXISTS kb_facts (
-          id TEXT,
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
           fact_text TEXT NOT NULL,
           years_min INTEGER,
           years_max INTEGER,
@@ -2388,23 +2392,25 @@ def ensure_kb_facts_table(conn):
     )
 
     # Existing deployments may already have a smaller kb_facts table.
+    # IMPORTANT: id is UUID, not TEXT.
     for statement in [
-        "ALTER TABLE kb_facts ADD COLUMN IF NOT EXISTS id TEXT",
+        "ALTER TABLE kb_facts ADD COLUMN IF NOT EXISTS id UUID",
         "ALTER TABLE kb_facts ADD COLUMN IF NOT EXISTS category TEXT DEFAULT 'General'",
         "ALTER TABLE kb_facts ADD COLUMN IF NOT EXISTS keywords TEXT DEFAULT ''",
         "ALTER TABLE kb_facts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
     ]:
         exec_no_return(conn, statement)
 
-    # Give older rows stable ids so they can be edited/deleted from the Admin UI.
+    # UUID columns can never contain an empty string, so only NULL rows need ids.
     exec_no_return(
         conn,
         """
         UPDATE kb_facts
-           SET id = md5(random()::text || clock_timestamp()::text || fact_text)
-         WHERE id IS NULL OR BTRIM(id) = ''
+           SET id = gen_random_uuid()
+         WHERE id IS NULL
         """,
     )
+
     exec_no_return(
         conn,
         "CREATE UNIQUE INDEX IF NOT EXISTS kb_facts_id_uidx ON kb_facts(id)",
@@ -3466,7 +3472,7 @@ def admin_list_facts(x_admin_key: str = Header(default="", alias="X-Admin-Key"))
         rows = exec_all(
             conn,
             """
-            SELECT id, fact_text, category, years_min, years_max, keywords, created_at, updated_at
+            SELECT id::text AS id, fact_text, category, years_min, years_max, keywords, created_at, updated_at
               FROM kb_facts
              ORDER BY updated_at DESC NULLS LAST, created_at DESC
              LIMIT 300
@@ -3501,7 +3507,7 @@ def admin_create_fact(req: AdminFactRequest, x_admin_key: str = Header(default="
                 (id, fact_text, category, years_min, years_max, keywords, created_at, updated_at)
             VALUES
                 (%s, %s, %s, %s, %s, %s, NOW(), NOW())
-            RETURNING id, fact_text, category, years_min, years_max, keywords, created_at, updated_at
+            RETURNING id::text AS id, fact_text, category, years_min, years_max, keywords, created_at, updated_at
             """,
             (fact_id, fact_text, category, req.years_min, req.years_max, keywords),
         )
@@ -3540,7 +3546,7 @@ def admin_update_fact(
                    keywords=%s,
                    updated_at=NOW()
              WHERE id=%s
-         RETURNING id, fact_text, category, years_min, years_max, keywords, created_at, updated_at
+         RETURNING id::text AS id, fact_text, category, years_min, years_max, keywords, created_at, updated_at
             """,
             (fact_text, category, req.years_min, req.years_max, keywords, fact_id),
         )
