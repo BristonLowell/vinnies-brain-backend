@@ -1176,7 +1176,7 @@ def get_relevant_facts(conn, year: int | None, user_message: str) -> List[str]:
                 """
                 SELECT fact_text,
                        COALESCE(category, '') AS category,
-                       COALESCE(keywords, '') AS keywords
+                       COALESCE(keywords::text, '') AS keywords
                   FROM kb_facts
                  ORDER BY created_at DESC
                  LIMIT 100
@@ -1187,7 +1187,7 @@ def get_relevant_facts(conn, year: int | None, user_message: str) -> List[str]:
                 """
                 SELECT fact_text,
                        COALESCE(category, '') AS category,
-                       COALESCE(keywords, '') AS keywords
+                       COALESCE(keywords::text, '') AS keywords
                   FROM kb_facts
                  WHERE (years_min IS NULL OR years_min <= %s)
                    AND (years_max IS NULL OR years_max >= %s)
@@ -1216,14 +1216,24 @@ def get_relevant_facts(conn, year: int | None, user_message: str) -> List[str]:
         if isinstance(row, dict):
             fact = str(row.get("fact_text") or "").strip()
             category = str(row.get("category") or "").strip()
-            keywords = str(row.get("keywords") or "").strip()
+            raw_keywords = row.get("keywords")
         else:
             try:
                 fact = str(row[0] or "").strip()
                 category = str(row[1] or "").strip()
-                keywords = str(row[2] or "").strip()
+                raw_keywords = row[2]
             except Exception:
                 continue
+
+        # kb_facts.keywords may be TEXT, TEXT[], or arrive as a PostgreSQL
+        # array literal such as "{water,heater}". Normalize all forms into
+        # a simple searchable string.
+        if isinstance(raw_keywords, (list, tuple)):
+            keywords = ", ".join(str(x).strip() for x in raw_keywords if str(x).strip())
+        else:
+            keywords = str(raw_keywords or "").strip()
+            if keywords.startswith("{") and keywords.endswith("}"):
+                keywords = keywords[1:-1].replace('","', ",").replace('"', "")
 
         if not fact:
             continue
@@ -3536,6 +3546,7 @@ def admin_create_fact(req: AdminFactRequest, x_admin_key: str = Header(default="
     fact_text = (req.fact_text or "").strip()
     category = (req.category or "General").strip() or "General"
     keywords = (req.keywords or "").strip()
+    keywords_db = [k.strip() for k in re.split(r"[,;|]", keywords) if k.strip()]
 
     if not fact_text:
         raise HTTPException(status_code=400, detail="Fact text is required.")
@@ -3554,7 +3565,7 @@ def admin_create_fact(req: AdminFactRequest, x_admin_key: str = Header(default="
                 (%s, %s, %s, %s, %s, %s, NOW(), NOW())
             RETURNING id::text AS id, fact_text, category, years_min, years_max, keywords, created_at, updated_at
             """,
-            (fact_id, fact_text, category, req.years_min, req.years_max, keywords),
+            (fact_id, fact_text, category, req.years_min, req.years_max, keywords_db),
         )
         conn.commit()
 
@@ -3572,6 +3583,7 @@ def admin_update_fact(
     fact_text = (req.fact_text or "").strip()
     category = (req.category or "General").strip() or "General"
     keywords = (req.keywords or "").strip()
+    keywords_db = [k.strip() for k in re.split(r"[,;|]", keywords) if k.strip()]
 
     if not fact_text:
         raise HTTPException(status_code=400, detail="Fact text is required.")
@@ -3593,7 +3605,7 @@ def admin_update_fact(
              WHERE id=%s
          RETURNING id::text AS id, fact_text, category, years_min, years_max, keywords, created_at, updated_at
             """,
-            (fact_text, category, req.years_min, req.years_max, keywords, fact_id),
+            (fact_text, category, req.years_min, req.years_max, keywords_db, fact_id),
         )
         if not row:
             raise HTTPException(status_code=404, detail="Fact not found.")
