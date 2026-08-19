@@ -1679,9 +1679,39 @@ def build_concise_troubleshooting_instruction() -> str:
         "If bullets are helpful, use short hyphen bullets only. "
         "Do not include a What we know so far section. "
         "Start with the most likely and easiest check first. "
+        "Do not repeat troubleshooting steps already present in the conversation history unless the customer asks you to repeat them. "
         "Ask for only one result or observation at the end. "
         "Do not include broad background, long checklists, or multiple possible branches unless safety requires it. "
         "For urgent safety issues, give the shortest safe instruction first, then stop and recommend professional help if needed."
+    ).strip()
+
+
+def build_troubleshooting_followup_instruction(
+    previous_troubleshooting: str,
+    user_response: str,
+) -> str:
+    """Tell the model to advance the diagnosis instead of repeating prior steps."""
+    previous = clean_ai_response_text(previous_troubleshooting or "").strip()
+    response = clean_ai_response_text(user_response or "").strip()
+
+    if len(previous) > 2600:
+        previous = previous[:2600].rstrip() + "…"
+
+    return (
+        "TROUBLESHOOTING_FOLLOWUP_INSTRUCTION:\n"
+        "The customer is responding to troubleshooting you already gave. "
+        "Use their new result to MOVE FORWARD in the diagnosis. "
+        "Do not repeat, restate, reword, or re-list troubleshooting steps that were already given unless the customer specifically asks you to repeat them. "
+        "Do not start over from the beginning. "
+        "Treat checks the customer says they completed as completed. "
+        "Treat observations they report as new diagnostic evidence. "
+        "If their response rules out a cause, move to the next most useful untried check. "
+        "If their response is too vague to know what happened, ask exactly one short targeted question instead of repeating the prior checklist. "
+        "Usually give only 1 or 2 NEW checks at a time, followed by one result question. "
+        "Use plain text only. Use short hyphen bullets only when needed. "
+        "Do not include headings, markdown, asterisks, or a What we know so far section.\n\n"
+        f"PREVIOUS TROUBLESHOOTING ALREADY GIVEN:\n{previous}\n\n"
+        f"CUSTOMER'S NEW RESPONSE:\n{response}"
     ).strip()
 
 
@@ -2231,9 +2261,8 @@ def rewrite_user_with_previous_context(
         troubleshooting = troubleshooting[:2600].rstrip() + "…"
 
     return (
-        "User is responding to the immediately previous troubleshooting response.\n"
-        f"Previous troubleshooting:\n{troubleshooting}\n"
-        f"User response: {current}"
+        "User is responding to the immediately previous troubleshooting steps. "
+        f"New result: {current}"
     )
 
 
@@ -3455,8 +3484,15 @@ def chat(req: ChatRequest):
     )
 
     # Keep troubleshooting answers short once intake is complete.
+    # Replies to previous troubleshooting use a stricter "move forward" instruction.
     if not natural_intake_mode:
-        flow_instruction = build_concise_troubleshooting_instruction()
+        if troubleshooting_for_linking:
+            flow_instruction = build_troubleshooting_followup_instruction(
+                troubleshooting_for_linking,
+                req.message,
+            )
+        else:
+            flow_instruction = build_concise_troubleshooting_instruction()
 
     response_context = (
         flow_instruction + "\n\n---\n\n" + "\n\n---\n\n".join(context_chunks)
