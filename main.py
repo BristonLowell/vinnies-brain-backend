@@ -1812,6 +1812,40 @@ def clean_answer_choices(choices: Any) -> List[str]:
     # buttons at all; the normal text box is safer than bad choices.
     return cleaned if len(cleaned) >= 2 else []
 
+def fallback_dynamic_answer_choices(question: str) -> List[str]:
+    """Reliable fallback choices when the small quick-reply model returns nothing.
+
+    These are intentionally generic and only answer the question being asked.
+    The mobile app still adds "I'm not sure".
+    """
+    q = clean_ai_response_text(question).strip()
+    ql = q.lower()
+    if not q:
+        return []
+
+    # Common either/or furnace-style questions.
+    if "blower" in ql and ("come on" in ql or "turn on" in ql or "run" in ql):
+        return ["Yes, the blower comes on", "No, nothing happens"]
+
+    if "propane" in ql and ("electric" in ql or "120v" in ql):
+        return ["Propane only", "Electric only", "Both"]
+
+    # Generic yes/no clarifying questions.
+    yes_no_starts = (
+        "is ", "are ", "was ", "were ", "does ", "do ", "did ",
+        "can ", "could ", "will ", "would ", "has ", "have ", "had ",
+    )
+    if ql.startswith(yes_no_starts):
+        return ["Yes", "No"]
+
+    # Questions that explicitly present two alternatives with "or".
+    if " or " in ql:
+        # Keep the fallback conservative rather than trying to parse arbitrary prose.
+        return ["First option", "Second option"]
+
+    return []
+
+
 def generate_dynamic_answer_choices(
     *,
     question: str,
@@ -1836,10 +1870,6 @@ def generate_dynamic_answer_choices(
 
     recent_history = format_transcript((history or [])[-10:], max_chars=4500)
     grounded_context = (knowledge_context or "").strip()[:7000]
-    if not grounded_context:
-        # Never invent button choices without the same Supabase knowledge that
-        # grounded the clarifying question.
-        return []
 
     try:
         client = OpenAI(api_key=api_key)  # type: ignore[operator]
@@ -1859,7 +1889,10 @@ def generate_dynamic_answer_choices(
                         "The choices must represent genuinely different branches, not synonyms, rephrasings, or overlapping versions of the same answer. "
                         "For a yes/no question, prefer simple Yes and No choices unless the question clearly needs distinct qualified states. "
                         "For where/when/how-often questions, use mutually distinct categories. "
-                        "Ground the choices in the supplied Supabase knowledge and conversation; do not invent model-specific facts or unsupported conditions. "
+                        "Use the supplied Supabase knowledge and conversation when relevant. "
+                        "If the exact question itself clearly defines the answer branches (for example yes/no, on/off, propane/electric/both), "
+                        "you may derive the choices directly from the wording of that question. "
+                        "Do not invent model-specific facts or unsupported repair conditions. "
                         "Keep each choice under 9 words and use customer-friendly wording. "
                         "Do not include 'I'm not sure', 'Other', or 'Something else'; the app adds those controls. "
                         "Do not give repair advice, diagnoses, warnings, or another question. "
@@ -1882,13 +1915,22 @@ def generate_dynamic_answer_choices(
 
         raw = (resp.choices[0].message.content or "").strip()
         if not raw:
-            return []
+            fallback = fallback_dynamic_answer_choices(question)
+            logger.info("Quick-reply model returned empty output; using fallback choices=%s", fallback)
+            return fallback
 
         data = json.loads(raw)
-        return clean_answer_choices(data.get("answer_choices"))
+        cleaned = clean_answer_choices(data.get("answer_choices"))
+        if cleaned:
+            return cleaned
+
+        fallback = fallback_dynamic_answer_choices(question)
+        logger.info("Quick-reply model produced no usable choices; using fallback choices=%s", fallback)
+        return fallback
     except Exception as e:
-        logger.warning("Quick-reply generation failed: %s", e)
-        return []
+        fallback = fallback_dynamic_answer_choices(question)
+        logger.warning("Quick-reply generation failed: %s; fallback choices=%s", e, fallback)
+        return fallback
 
 
 _TROUBLESHOOTING_ACTION_WORDS = (
@@ -3120,7 +3162,10 @@ def chat(req: ChatRequest):
     response_question = first_question_from_response(answer, clarifying)
 
     answer_choices: List[str] = []
-    should_offer_answer_choices = natural_intake_mode or bool(clarifying)
+    # Dynamic quick replies are ONLY for the initial intake/clarifying phase.
+    # Once troubleshooting begins, never return answer_choices, even if the
+    # troubleshooting response ends with a question.
+    should_offer_answer_choices = natural_intake_mode
     if not is_troubleshooting_response and response_question and should_offer_answer_choices:
         answer_choices = generate_dynamic_answer_choices(
             question=response_question,
@@ -3128,7 +3173,10 @@ def chat(req: ChatRequest):
             current_user_message=req.message,
             airstream_year=year,
             category=category,
-            knowledge_context="\n\n---\n\n".join(context_chunks),
+            knowledge_context=(
+                "\n\n---\n\n".join(context_chunks)
+                + ("\n\nAUTHORITATIVE FACTS:\n- " + "\n- ".join(authoritative_facts) if authoritative_facts else "")
+            ).strip(),
         )
 
     # Checkpoint summaries are disabled; the app no longer shows the "What we know so far" card.
