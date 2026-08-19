@@ -2128,33 +2128,113 @@ def _recent_issue_context(history: List[Dict[str, Any]], current_user_text: str 
     return user_messages[-1] if user_messages else ""
 
 
+def last_visible_assistant_message(history: List[Dict[str, Any]]) -> str:
+    """Return the immediately previous visible assistant message."""
+    for m in reversed(history or []):
+        if (m.get("role") or "").strip().lower() != "assistant":
+            continue
+        return clean_ai_response_text(str(m.get("text") or "")).strip()
+    return ""
+
+
+def last_visible_assistant_question(history: List[Dict[str, Any]]) -> Optional[str]:
+    """Return a question only if the MOST RECENT visible assistant message contains one.
+
+    If the latest assistant response was troubleshooting steps with no question,
+    return None so the user's next message is treated as a fresh response rather
+    than being linked back to an older intake question.
+    """
+    for m in reversed(history or []):
+        if (m.get("role") or "").strip().lower() != "assistant":
+            continue
+
+        text = clean_ai_response_text(str(m.get("text") or "")).strip()
+        if not text or "?" not in text:
+            return None
+
+        # Use the last visible question in the latest assistant message.
+        matches = re.findall(r"[^?\n]*\?", text)
+        if not matches:
+            return None
+
+        question = matches[-1].strip().strip("-• ")
+        return question or None
+
+    return None
+
+
 def build_linked_retrieval_query(
     user_text: str,
     active_question_text: Optional[str],
+    previous_troubleshooting_text: Optional[str],
     history: List[Dict[str, Any]],
 ) -> str:
-    """Link every follow-up answer to the exact prior AI question.
+    """Build retrieval context from what the user is actually replying to.
 
-    This prevents quick replies such as "No", "Both", or "Propane only" from
-    being searched as if they were standalone topics.
+    Priority:
+    1) If the immediately previous AI message asked a question, link to that question.
+    2) Otherwise, if it was troubleshooting/advice, link to those troubleshooting steps.
+    3) Never reach backward to an older stale question.
     """
     current = (user_text or "").strip()
     question = (active_question_text or "").strip()
+    troubleshooting = (previous_troubleshooting_text or "").strip()
 
     if question.startswith("**") and question.endswith("**") and len(question) > 4:
         question = question[2:-2].strip()
+
+    # Keep retrieval prompts reasonably small while retaining all useful step context.
+    if len(troubleshooting) > 2600:
+        troubleshooting = troubleshooting[:2600].rstrip() + "…"
 
     issue = _recent_issue_context(history, current)
 
     parts: List[str] = []
     if issue:
         parts.append(f"Issue: {issue}")
+
     if question:
         parts.append(f"Previous AI question: {question}")
+    elif troubleshooting:
+        parts.append(f"Previous troubleshooting response: {troubleshooting}")
+
     if current:
-        parts.append(f"User answer: {current}")
+        parts.append(f"User response: {current}")
 
     return "\n".join(parts).strip() or current
+
+
+def rewrite_user_with_previous_context(
+    user_text: str,
+    question_text: Optional[str],
+    troubleshooting_text: Optional[str],
+) -> str:
+    """Give the answer model the same conversational linkage used for retrieval."""
+    current = (user_text or "").strip()
+
+    if question_text:
+        return rewrite_short_answer(current, question_text)
+
+    troubleshooting = (troubleshooting_text or "").strip()
+    if not troubleshooting:
+        return current
+
+    if should_reset_flow(current):
+        return current
+
+    # If the customer asks a new explicit question, let the history provide context
+    # without forcing the message to be phrased as a troubleshooting result.
+    if "?" in current:
+        return current
+
+    if len(troubleshooting) > 2600:
+        troubleshooting = troubleshooting[:2600].rstrip() + "…"
+
+    return (
+        "User is responding to the immediately previous troubleshooting response.\n"
+        f"Previous troubleshooting:\n{troubleshooting}\n"
+        f"User response: {current}"
+    )
 
 
 def is_followup_answer(user_text: str, active_question_text: Optional[str]) -> bool:
@@ -3008,24 +3088,52 @@ def chat(req: ChatRequest):
         # attached to the exact question it is answering.
         history = get_recent_messages(conn, req.session_id, limit=50)
 
+        # Determine exactly what the customer is replying to. Never reach back
+        # past the immediately previous assistant message.
+        latest_assistant_text = last_visible_assistant_message(history)
+        question_for_linking = last_visible_assistant_question(history)
+
+        troubleshooting_for_linking: Optional[str] = None
+        if (
+            latest_assistant_text
+            and not question_for_linking
+            and looks_like_troubleshooting_response(
+                latest_assistant_text,
+                natural_intake_mode=False,
+            )
+        ):
+            troubleshooting_for_linking = latest_assistant_text
+
         retrieval_query = build_linked_retrieval_query(
             req.message,
-            active_question_text,
+            question_for_linking,
+            troubleshooting_for_linking,
             history,
         )
 
+        context_type = (
+            "question"
+            if question_for_linking
+            else ("troubleshooting" if troubleshooting_for_linking else "none")
+        )
         logger.info(
-            "Linked retrieval session=%s query=%s",
+            "Linked retrieval session=%s previous_context=%s query=%s",
             req.session_id,
-            retrieval_query.replace("\n", " | ")[:800],
+            context_type,
+            retrieval_query.replace("\n", " | ")[:1000],
         )
 
-        # The answer model also receives the linked interpretation.
-        rewritten_user_message = rewrite_short_answer(req.message, active_question_text)
+        # The answer model follows the same linkage rule as retrieval.
+        rewritten_user_message = rewrite_user_with_previous_context(
+            req.message,
+            question_for_linking,
+            troubleshooting_for_linking,
+        )
 
-        # Stay on a pinned troubleshooting article/tree for conversational answers,
-        # including dynamic replies such as "No, nothing happens".
-        followup_answer = is_followup_answer(req.message, active_question_text)
+        # A decision-tree node should advance only when there is a current visible
+        # question to answer. A reply to plain troubleshooting steps stays in the
+        # same issue context without pretending an older question is still active.
+        followup_answer = is_followup_answer(req.message, question_for_linking)
         use_pinned = bool(
             pin_supported
             and active_article_id
@@ -3043,13 +3151,16 @@ def chat(req: ChatRequest):
             with conn.transaction():
                 authoritative_facts = get_relevant_facts(conn, year, retrieval_query)
 
-                # Second chance: the previous question itself often contains the
-                # strongest subsystem words (furnace, blower, water heater, etc.).
-                if not authoritative_facts and active_question_text:
+                # Second chance: the immediately previous question or troubleshooting
+                # response often contains the strongest subsystem words.
+                previous_context_for_search = (
+                    question_for_linking or troubleshooting_for_linking
+                )
+                if not authoritative_facts and previous_context_for_search:
                     authoritative_facts = get_relevant_facts(
                         conn,
                         year,
-                        active_question_text,
+                        previous_context_for_search,
                     )
         except Exception as e:
             logger.warning(
@@ -3060,12 +3171,9 @@ def chat(req: ChatRequest):
             )
             authoritative_facts = []
 
-        # Step B: compute pending_q from the last stored assistant question
-        pending_q = (active_question_text or "").strip()
-        if pending_q.startswith("**") and pending_q.endswith("**") and len(pending_q) > 4:
-            pending_q = pending_q[2:-2].strip()
-        if not pending_q:
-            pending_q = None
+        # Step B: a pending question exists only if the immediately previous
+        # visible assistant response actually asked one.
+        pending_q = (question_for_linking or "").strip() or None
 
         # Build context (DB-only work)
         if use_pinned:
@@ -3100,8 +3208,13 @@ def chat(req: ChatRequest):
                     if qtext:
                         chunk += f"ACTIVE_TROUBLESHOOTING_NODE:\n{next_node}\nQUESTION:\n{qtext}\n"
 
-                if (active_question_text or "").strip():
-                    chunk += f'\nLAST_AI_QUESTION:\n{active_question_text.strip()}\n'
+                if (question_for_linking or "").strip():
+                    chunk += f'\nLAST_AI_QUESTION:\n{question_for_linking.strip()}\n'
+                elif (troubleshooting_for_linking or "").strip():
+                    chunk += (
+                        f'\nLAST_AI_TROUBLESHOOTING_RESPONSE:\n'
+                        f'{troubleshooting_for_linking.strip()}\n'
+                    )
 
                 context_chunks.append(chunk)
                 from_kb = True
@@ -3245,9 +3358,12 @@ def chat(req: ChatRequest):
     # Second-chance semantic retrieval for follow-up answers. If the linked query
     # still failed, search the exact previous AI question, which usually contains
     # the strongest subsystem terminology.
-    if not context_chunks and active_question_text:
+    fallback_context_for_search = (
+        question_for_linking or troubleshooting_for_linking
+    )
+    if not context_chunks and fallback_context_for_search:
         try:
-            fallback_emb = embed(active_question_text)
+            fallback_emb = embed(fallback_context_for_search)
         except Exception:
             fallback_emb = []
 
@@ -3332,7 +3448,11 @@ def chat(req: ChatRequest):
         )
 
     # Prepare rewritten_user_message again (we computed it inside DB phase, but keep it stable)
-    rewritten_user_message = rewrite_short_answer(req.message, active_question_text)
+    rewritten_user_message = rewrite_user_with_previous_context(
+        req.message,
+        question_for_linking,
+        troubleshooting_for_linking,
+    )
 
     # Keep troubleshooting answers short once intake is complete.
     if not natural_intake_mode:
@@ -3388,7 +3508,12 @@ def chat(req: ChatRequest):
 
     # Find the single question the quick replies should answer. This works whether
     # the model placed it in `answer` or `clarifying_questions`.
-    response_question = first_question_from_response(answer, clarifying)
+    if is_troubleshooting_response:
+        # Once troubleshooting has started, only link the next user reply if the
+        # visible troubleshooting response itself asks a question.
+        response_question = first_question_from_response(answer, [])
+    else:
+        response_question = first_question_from_response(answer, clarifying)
 
     answer_choices: List[str] = []
     # Dynamic quick replies are ONLY for the initial intake/clarifying phase.
