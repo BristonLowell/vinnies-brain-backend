@@ -2036,6 +2036,13 @@ def normalize_yes_no(text: str) -> Optional[str]:
     t = (text or "").strip().lower()
     if t in YES_NO_MAP:
         return YES_NO_MAP[t]
+
+    # Dynamic quick replies may be phrases such as
+    # "No, nothing happens" or "Yes, the blower comes on".
+    first = re.split(r"[\s,;:.-]+", t, maxsplit=1)[0] if t else ""
+    if first in YES_NO_MAP:
+        return YES_NO_MAP[first]
+
     return None
 
 
@@ -2097,6 +2104,75 @@ def node_text(tree: Dict[str, Any], node_id: str) -> str:
 def should_reset_flow(message: str) -> bool:
     t = (message or "").lower()
     return any(p in t for p in ["new issue", "different issue", "different problem", "switch topic", "switch topics", "reset"])
+
+
+def _recent_issue_context(history: List[Dict[str, Any]], current_user_text: str = "") -> str:
+    """Find a useful recent user issue statement for retrieval context."""
+    current = (current_user_text or "").strip()
+
+    # Prefer the earliest substantive user description in the current issue.
+    user_messages: List[str] = []
+    for m in history or []:
+        if (m.get("role") or "").strip().lower() != "user":
+            continue
+        candidate = (m.get("text") or "").strip()
+        if not candidate or candidate == current:
+            continue
+        user_messages.append(candidate)
+
+    for candidate in user_messages:
+        wc = len(candidate.split())
+        if len(candidate) >= 12 or wc >= 3:
+            return candidate
+
+    return user_messages[-1] if user_messages else ""
+
+
+def build_linked_retrieval_query(
+    user_text: str,
+    active_question_text: Optional[str],
+    history: List[Dict[str, Any]],
+) -> str:
+    """Link every follow-up answer to the exact prior AI question.
+
+    This prevents quick replies such as "No", "Both", or "Propane only" from
+    being searched as if they were standalone topics.
+    """
+    current = (user_text or "").strip()
+    question = (active_question_text or "").strip()
+
+    if question.startswith("**") and question.endswith("**") and len(question) > 4:
+        question = question[2:-2].strip()
+
+    issue = _recent_issue_context(history, current)
+
+    parts: List[str] = []
+    if issue:
+        parts.append(f"Issue: {issue}")
+    if question:
+        parts.append(f"Previous AI question: {question}")
+    if current:
+        parts.append(f"User answer: {current}")
+
+    return "\n".join(parts).strip() or current
+
+
+def is_followup_answer(user_text: str, active_question_text: Optional[str]) -> bool:
+    """True when the new user message should stay attached to the prior question."""
+    q = (active_question_text or "").strip()
+    t = (user_text or "").strip()
+
+    if not q or not t:
+        return False
+    if should_reset_flow(t):
+        return False
+
+    # A new explicit question is treated as a fresh query instead of an answer.
+    if "?" in t:
+        return False
+
+    # Dynamic replies and normal conversational answers are typically short.
+    return len(t) <= 180
 
 
 def rewrite_short_answer(user_text: str, active_question_text: Optional[str]) -> str:
@@ -2171,23 +2247,57 @@ def rank_kb_articles(conn, query_embedding: List[float], year: Optional[int], ca
 
 
 def keyword_kb_articles(conn, query_text: str, year: Optional[int], category: Optional[str], top_k: int = 6):
+    """Keyword retrieval that works with linked conversational queries.
+
+    Instead of requiring the entire multi-line linked query to appear verbatim,
+    extract meaningful terms from the issue + previous question + current answer
+    and rank matching articles by overlap.
+    """
     q = (query_text or "").strip()
     if not q:
         return []
 
-    sql = """
+    stop_words = {
+        "about", "after", "again", "airstream", "answer", "because", "been",
+        "both", "could", "does", "from", "have", "into", "issue", "just",
+        "like", "nothing", "previous", "question", "really", "that", "their",
+        "there", "these", "they", "this", "user", "what", "when", "where",
+        "which", "with", "would", "your", "youre",
+    }
+
+    tokens: List[str] = []
+    seen: Set[str] = set()
+    for token in re.findall(r"[a-z0-9]+", q.lower()):
+        if len(token) < 3 or token in stop_words:
+            continue
+        if token in seen:
+            continue
+        seen.add(token)
+        tokens.append(token)
+
+    # Favor the most issue-specific terms but keep enough recall for follow-ups.
+    terms = tokens[:12]
+    if not terms:
+        return []
+
+    conditions: List[str] = []
+    params: List[Any] = []
+
+    for term in terms:
+        like = f"%{term}%"
+        conditions.append(
+            "(title ILIKE %s OR COALESCE(retrieval_text, '') ILIKE %s OR COALESCE(customer_summary, '') ILIKE %s)"
+        )
+        params.extend([like, like, like])
+
+    sql = f"""
     SELECT id, title,
            customer_summary AS body,
            retrieval_text,
            decision_tree
       FROM kb_articles
-     WHERE (
-        title ILIKE %s
-        OR COALESCE(retrieval_text, '') ILIKE %s
-        OR COALESCE(customer_summary, '') ILIKE %s
-     )
+     WHERE ({' OR '.join(conditions)})
     """
-    params: List[Any] = [f"%{q}%", f"%{q}%", f"%{q}%"]
 
     if year is not None:
         sql += " AND years_min <= %s AND years_max >= %s"
@@ -2197,11 +2307,33 @@ def keyword_kb_articles(conn, query_text: str, year: Optional[int], category: Op
         sql += " AND category = %s"
         params.append(category)
 
+    # Fetch a few extra rows and rank them in Python by term overlap.
     sql += " LIMIT %s"
-    params.append(top_k)
+    params.append(max(top_k * 5, 20))
 
-    rows = exec_all(conn, sql, tuple(params))
-    return [(r, 0.95) for r in rows]
+    rows = exec_all(conn, sql, tuple(params)) or []
+
+    scored: List[Tuple[int, Dict[str, Any]]] = []
+    for r in rows:
+        searchable = " ".join(
+            [
+                str(r.get("title") or ""),
+                str(r.get("retrieval_text") or ""),
+                str(r.get("body") or ""),
+            ]
+        ).lower()
+
+        score = sum(1 for term in terms if term in searchable)
+
+        # Extra weight for strong subsystem words from the linked query.
+        title = str(r.get("title") or "").lower()
+        score += sum(2 for term in terms if term in title)
+
+        if score > 0:
+            scored.append((score, r))
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [(r, 0.95) for _, r in scored[:top_k]]
 
 
 # =========================
@@ -2777,6 +2909,7 @@ def chat(req: ChatRequest):
     flow_instruction = ""
 
     history: List[Dict[str, Any]] = []
+    retrieval_query: str = req.message
 
     authoritative_facts: List[str] = []
 
@@ -2871,10 +3004,35 @@ def chat(req: ChatRequest):
 
         yn = normalize_yes_no(req.message)
 
-        # If user says yes/no and we have a stored question, rewrite it so the model knows what it's answering.
+        # Load conversation history before retrieval so each new answer can be
+        # attached to the exact question it is answering.
+        history = get_recent_messages(conn, req.session_id, limit=50)
+
+        retrieval_query = build_linked_retrieval_query(
+            req.message,
+            active_question_text,
+            history,
+        )
+
+        logger.info(
+            "Linked retrieval session=%s query=%s",
+            req.session_id,
+            retrieval_query.replace("\n", " | ")[:800],
+        )
+
+        # The answer model also receives the linked interpretation.
         rewritten_user_message = rewrite_short_answer(req.message, active_question_text)
 
-        use_pinned = bool(pin_supported and active_article_id and isinstance(active_tree, dict) and active_node_id and yn)
+        # Stay on a pinned troubleshooting article/tree for conversational answers,
+        # including dynamic replies such as "No, nothing happens".
+        followup_answer = is_followup_answer(req.message, active_question_text)
+        use_pinned = bool(
+            pin_supported
+            and active_article_id
+            and isinstance(active_tree, dict)
+            and active_node_id
+            and (yn or followup_answer)
+        )
 
         # Fetch authoritative micro-facts from DB (fast).
         # This lookup is optional, so isolate it with a SAVEPOINT. Previously an
@@ -2883,7 +3041,16 @@ def chat(req: ChatRequest):
         # InFailedSqlTransaction.
         try:
             with conn.transaction():
-                authoritative_facts = get_relevant_facts(conn, year, req.message)
+                authoritative_facts = get_relevant_facts(conn, year, retrieval_query)
+
+                # Second chance: the previous question itself often contains the
+                # strongest subsystem words (furnace, blower, water heater, etc.).
+                if not authoritative_facts and active_question_text:
+                    authoritative_facts = get_relevant_facts(
+                        conn,
+                        year,
+                        active_question_text,
+                    )
         except Exception as e:
             logger.warning(
                 "Authoritative facts lookup failed session=%s year=%s error=%s",
@@ -2947,7 +3114,7 @@ def chat(req: ChatRequest):
             # we can still fall back to vector search below.
             try:
                 with conn.transaction():
-                    ranked = keyword_kb_articles(conn, req.message, year, category, top_k=6)
+                    ranked = keyword_kb_articles(conn, retrieval_query, year, category, top_k=6)
             except Exception as e:
                 logger.warning(
                     "Keyword KB lookup failed session=%s year=%s category=%s error=%s",
@@ -2997,8 +3164,7 @@ def chat(req: ChatRequest):
                 need_vector_search = True
                 conn.commit()
 
-        # Pull recent messages (DB)
-        history = get_recent_messages(conn, req.session_id, limit=50)
+        # Determine intake/troubleshooting phase using the history already loaded above.
         natural_intake_mode = should_use_natural_intake_mode(history, req.message)
         if natural_intake_mode:
             flow_instruction = build_natural_intake_instruction(history, flags)
@@ -3023,7 +3189,7 @@ def chat(req: ChatRequest):
     # -------------------------
     if need_vector_search:
         try:
-            q_emb = embed(req.message)  # OpenAI embeddings (network)
+            q_emb = embed(retrieval_query)  # linked issue + prior question + current answer
         except Exception:
             q_emb = []
 
@@ -3076,6 +3242,52 @@ def chat(req: ChatRequest):
                         )
                         conn.commit()
 
+    # Second-chance semantic retrieval for follow-up answers. If the linked query
+    # still failed, search the exact previous AI question, which usually contains
+    # the strongest subsystem terminology.
+    if not context_chunks and active_question_text:
+        try:
+            fallback_emb = embed(active_question_text)
+        except Exception:
+            fallback_emb = []
+
+        if fallback_emb:
+            with db() as conn:
+                try:
+                    with conn.transaction():
+                        fallback_ranked = rank_kb_articles(
+                            conn,
+                            fallback_emb,
+                            year,
+                            category,
+                            top_k=6,
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "Fallback vector KB lookup failed session=%s error=%s",
+                        req.session_id,
+                        e,
+                    )
+                    fallback_ranked = []
+
+                for r, score in fallback_ranked:
+                    if score < 0.15:
+                        continue
+
+                    if not any(a.get("id") == r.get("id") for a in used_articles):
+                        used_articles.append({"id": r["id"], "title": r["title"]})
+
+                    rt = (r.get("retrieval_text") or "").strip()
+                    body = (r.get("body") or "").strip()
+
+                    chunk = f"TITLE: {r['title']}\n"
+                    if rt:
+                        chunk += f"RETRIEVAL_TEXT:\n{rt}\n"
+                    chunk += f"BODY:\n{body}"
+                    context_chunks.append(chunk)
+
+                from_kb = len(context_chunks) > 0
+
     # HARD GROUNDING GATE: do not call the answer model until relevant
     # troubleshooting knowledge has actually been loaded from Supabase/Postgres.
     # This prevents the first AI turn from answering from generic model knowledge
@@ -3088,8 +3300,25 @@ def chat(req: ChatRequest):
             year,
             category,
         )
+        fallback_question = (
+            "I need one more detail to match this to the right Airstream information. "
+            "What exactly happens when you try it?"
+        )
+
+        # Save the turn so the conversation does not break or show a blank bubble.
+        with db() as conn:
+            if sessions_supports_active_question(conn):
+                exec_no_return(
+                    conn,
+                    "UPDATE sessions SET active_question_text=%s WHERE id=%s",
+                    (fallback_question, req.session_id),
+                )
+            log_message(conn, req.session_id, "user", req.message)
+            log_message(conn, req.session_id, "assistant", fallback_question)
+            conn.commit()
+
         return ChatResponse(
-            answer="",
+            answer=fallback_question,
             checkpoint_summary=None,
             clarifying_questions=[],
             knowledge_ready=False,
