@@ -1674,13 +1674,17 @@ def build_concise_troubleshooting_instruction() -> str:
     return (
         "RESPONSE_STYLE_INSTRUCTION:\n"
         "The customer is now past intake. Give concise troubleshooting help. "
-        "Keep the answer short: usually 2 to 4 brief bullet points or steps, no long explanations. "
+        "Give only 1 or 2 NEW checks at a time. "
+        "Each check must be one simple action, not several checks bundled into one bullet. "
+        "Keep each check brief, usually one sentence and preferably under about 25 words. "
         "Use plain text only. Do not use asterisks, markdown bold, heading labels, or long section titles. "
         "If bullets are helpful, use short hyphen bullets only. "
         "Do not include a What we know so far section. "
-        "Start with the most likely and easiest check first. "
+        "Start with the most likely and easiest untried check first. "
         "Do not repeat troubleshooting steps already present in the conversation history unless the customer asks you to repeat them. "
-        "Ask for only one result or observation at the end. "
+        "Do not ask a diagnostic question and then continue as though you already know the answer. "
+        "If you need an answer before choosing the next check, ask that ONE question and stop; do not give troubleshooting steps in the same response. "
+        "If you give troubleshooting steps, you may ask only one short result question after them, and that question must be about the NEW check you just gave. "
         "Do not include broad background, long checklists, or multiple possible branches unless safety requires it. "
         "For urgent safety issues, give the shortest safe instruction first, then stop and recommend professional help if needed."
     ).strip()
@@ -1690,27 +1694,27 @@ def build_troubleshooting_followup_instruction(
     previous_troubleshooting: str,
     user_response: str,
 ) -> str:
-    """Tell the model to advance the diagnosis instead of repeating prior steps."""
-    previous = clean_ai_response_text(previous_troubleshooting or "").strip()
+    """Advance the diagnosis without re-injecting old troubleshooting text."""
     response = clean_ai_response_text(user_response or "").strip()
-
-    if len(previous) > 2600:
-        previous = previous[:2600].rstrip() + "…"
 
     return (
         "TROUBLESHOOTING_FOLLOWUP_INSTRUCTION:\n"
-        "The customer is responding to troubleshooting you already gave. "
-        "Use their new result to MOVE FORWARD in the diagnosis. "
-        "Do not repeat, restate, reword, or re-list troubleshooting steps that were already given unless the customer specifically asks you to repeat them. "
+        "The customer is responding to the immediately previous troubleshooting response in RECENT CHAT HISTORY. "
+        "Use the customer's new result to MOVE FORWARD in the diagnosis. "
+        "Do not repeat, restate, reword, summarize, or re-list the immediately previous troubleshooting steps unless the customer specifically asks you to repeat them. "
         "Do not start over from the beginning. "
         "Treat checks the customer says they completed as completed. "
         "Treat observations they report as new diagnostic evidence. "
-        "If their response rules out a cause, move to the next most useful untried check. "
-        "If their response is too vague to know what happened, ask exactly one short targeted question instead of repeating the prior checklist. "
-        "Usually give only 1 or 2 NEW checks at a time, followed by one result question. "
+        "If their response rules out a cause, move to the next most useful UNTRIED check. "
+        "Give only 1 or 2 NEW checks at a time. "
+        "Each new check must be one simple action, not multiple actions bundled into one bullet. "
+        "Keep each check brief, usually one sentence and preferably under about 25 words. "
+        "If the response is too vague to know what happened, ask exactly ONE short targeted question and STOP. "
+        "Never ask a question and then continue as if one possible answer were already confirmed. "
+        "If a question must be answered before the next diagnostic step, return the question only and do not provide troubleshooting in that same response. "
+        "If you do provide new troubleshooting, any result question must refer only to the new check you just gave. "
         "Use plain text only. Use short hyphen bullets only when needed. "
         "Do not include headings, markdown, asterisks, or a What we know so far section.\n\n"
-        f"PREVIOUS TROUBLESHOOTING ALREADY GIVEN:\n{previous}\n\n"
         f"CUSTOMER'S NEW RESPONSE:\n{response}"
     ).strip()
 
@@ -3239,11 +3243,6 @@ def chat(req: ChatRequest):
 
                 if (question_for_linking or "").strip():
                     chunk += f'\nLAST_AI_QUESTION:\n{question_for_linking.strip()}\n'
-                elif (troubleshooting_for_linking or "").strip():
-                    chunk += (
-                        f'\nLAST_AI_TROUBLESHOOTING_RESPONSE:\n'
-                        f'{troubleshooting_for_linking.strip()}\n'
-                    )
 
                 context_chunks.append(chunk)
                 from_kb = True

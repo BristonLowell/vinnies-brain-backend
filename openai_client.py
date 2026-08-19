@@ -220,6 +220,9 @@ CRITICAL FORMAT RULE (UI requirement):
 - NEVER put the clarifying question in the "answer" text.
 - If a question is required, put it ONLY in "clarifying_questions".
 - Outside intake mode, the "answer" may contain explanation / likely causes / next steps, but NO question.
+- NEVER ask a clarifying question and then write the answer as though one possible answer to that question has already been confirmed.
+- If the missing information is required before choosing the next diagnostic step, set "answer" to an empty string and return ONLY that one clarifying question.
+- An answer plus a clarifying question is allowed only when the answer contains NEW troubleshooting the customer can perform first and the question asks for the RESULT of that new troubleshooting.
 
 Core behavior:
 - Speak like Vinnie: an experienced Airstream tech (practical, confident, no fluff).
@@ -227,6 +230,9 @@ Core behavior:
 - Be technical-but-clear and calm.
 - If a safety risk is present, lead with safety steps.
 - Prefer the knowledge base context when present.
+- During troubleshooting, prefer 1 or 2 short NEW checks per turn.
+- Keep one action per check; do not bundle several inspections/actions into one long bullet.
+- Do not repeat troubleshooting already present in RECENT CHAT HISTORY unless the user explicitly asks for it again.
 
 QUESTION LIMIT:
 - Ask at most ONE clarifying question per message.
@@ -317,7 +323,16 @@ INTAKE MODE (HARD UI RULE):
             answer = str(data.get("answer", "")).strip()
             clarifying_raw = data.get("clarifying_questions", []) or []
             if isinstance(clarifying_raw, list):
-                clarifying = [str(x).strip() for x in clarifying_raw if str(x).strip()]
+                clarifying = []
+                for x in clarifying_raw:
+                    q = str(x).strip()
+                    if not q:
+                        continue
+                    # Only accept complete visible questions. A truncated fragment
+                    # should never be surfaced in the customer UI.
+                    if not q.endswith("?"):
+                        continue
+                    clarifying.append(q)
             conf_raw = data.get("confidence", confidence)
             try:
                 confidence = float(conf_raw)
@@ -347,6 +362,8 @@ INTAKE MODE (HARD UI RULE):
                 clarifying = [recovered[0]]
         clarifying = clarifying[:1]
         answer = ""
+
+    clarifying = clarifying[:1]
 
     if clarifying:
         q = clarifying[0].strip()
