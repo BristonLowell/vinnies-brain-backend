@@ -1433,24 +1433,25 @@ def classify_airstream_scope(
     history: List[Dict[str, Any]],
     airstream_year: Optional[int],
     category: Optional[str],
-) -> Tuple[bool, str, str, float, str]:
+) -> Tuple[bool, str, str, float]:
     """Classify scope and, when useful, recognize the likely Airstream component.
 
     Returns:
-      (in_scope, reason, component_hint, component_confidence, targeted_question)
+      (in_scope, reason, component_hint, component_confidence)
 
-    The component hint is intentionally advisory. It is only used when the model
-    is reasonably confident, so unrelated/ambiguous questions continue through
-    the normal intake flow.
+    IMPORTANT:
+    This helper does NOT choose the next customer-facing question. Question
+    selection belongs to the main conversation model, which has the full
+    diagnostic history and can avoid asking for facts the customer already gave.
     """
     message = clean_ai_response_text(user_message or "").strip()
     if not message:
-        return True, "empty_message", "", 0.0, ""
+        return True, "empty_message", "", 0.0
 
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if OpenAI is None or not api_key:
         logger.warning("Scope/component classifier unavailable; allowing chat turn")
-        return True, "classifier_unavailable", "", 0.0, ""
+        return True, "classifier_unavailable", "", 0.0
 
     recent_history = format_transcript((history or [])[-10:], max_chars=4500)
 
@@ -1459,7 +1460,7 @@ def classify_airstream_scope(
         resp = client.chat.completions.create(
             model=OPENAI_SCOPE_MODEL or "gpt-4o-mini",
             temperature=0.0,
-            max_tokens=220,
+            max_tokens=160,
             response_format={"type": "json_object"},
             messages=[
                 {
@@ -1469,7 +1470,7 @@ def classify_airstream_scope(
                         "an Airstream troubleshooting app. "
                         "Return JSON only with this shape: "
                         '{"in_scope":true,"reason":"short reason","component_hint":"",'
-                        '"component_confidence":0.0,"targeted_question":""}. '
+                        '"component_confidence":0.0}. '
 
                         "SCOPE RULE: Set in_scope=false when the user's ACTUAL problem is clearly NOT "
                         "with the Airstream, an Airstream-installed system, or the trailer-side "
@@ -1488,14 +1489,6 @@ def classify_airstream_scope(
                         "Set component_hint to a short canonical component name only when useful, such as "
                         "'exterior entry step', 'furnace', 'water heater', 'awning', 'fresh-water pump', "
                         "or another appropriate Airstream component. component_confidence must be 0 to 1. "
-
-                        "TARGETED QUESTION RULE: If the issue is in scope and a useful clarifying question "
-                        "can be asked without repair knowledge, provide one short customer-friendly question "
-                        "about the recognized component's observable behavior/state. Do not ask the customer "
-                        "to identify a component they already clearly named or that you can confidently infer. "
-                        "Do not provide troubleshooting or repair advice in targeted_question. "
-                        "Do not repeat a question already answered in the recent conversation. "
-                        "If no targeted question is needed or the component is too ambiguous, return an empty string. "
 
                         "Examples that are IN scope: Airstream appliances/systems, trailer running/marker/brake "
                         "lights, the Airstream side of a 7-pin connection, trailer brakes, or diagnosing whether "
@@ -1526,7 +1519,6 @@ def classify_airstream_scope(
         in_scope = data.get("in_scope")
         reason = clean_ai_response_text(str(data.get("reason") or "")).strip()
         component_hint = clean_ai_response_text(str(data.get("component_hint") or "")).strip()
-        targeted_question = clean_ai_response_text(str(data.get("targeted_question") or "")).strip()
 
         try:
             component_confidence = float(data.get("component_confidence", 0.0) or 0.0)
@@ -1534,14 +1526,9 @@ def classify_airstream_scope(
             component_confidence = 0.0
         component_confidence = clamp01(component_confidence)
 
-        # Only surface complete questions.
-        if targeted_question and not targeted_question.endswith("?"):
-            targeted_question = ""
-
         # Low-confidence guesses must not steer retrieval or conversation.
         if component_confidence < 0.72:
             component_hint = ""
-            targeted_question = ""
 
         if isinstance(in_scope, bool):
             return (
@@ -1549,15 +1536,14 @@ def classify_airstream_scope(
                 reason or ("in_scope" if in_scope else "out_of_scope"),
                 component_hint,
                 component_confidence,
-                targeted_question,
             )
 
         logger.warning("Scope/component classifier returned invalid payload: %s", raw[:700])
-        return True, "invalid_classifier_payload", "", 0.0, ""
+        return True, "invalid_classifier_payload", "", 0.0
 
     except Exception as e:
         logger.warning("Scope/component classifier failed: %s", e)
-        return True, "classifier_error", "", 0.0, ""
+        return True, "classifier_error", "", 0.0
 
 
 def require_admin(x_admin_key: str) -> None:
@@ -1836,7 +1822,8 @@ def build_natural_intake_instruction(history: List[Dict[str, Any]], safety_flags
         "Do not use a canned or pre-formatted starter question. "
         "Keep the question short and conversational. "
         "Use plain text only. Do not use markdown, asterisks, bold text markers, headings, or numbered lists. "
-        f"After about {remaining} more customer answer(s), move into troubleshooting steps based on what you learned. "
+        f"Use roughly {remaining} more customer answer(s) only if they are actually needed. "
+        "As soon as the component and symptom are specific enough to choose a grounded next check, stop intake and move into troubleshooting on the next turn. "
         f"{safety_note}"
     ).strip()
 
@@ -2410,6 +2397,56 @@ def build_linked_retrieval_query(
 
     return "\n".join(parts).strip() or current
 
+
+
+def build_accumulated_issue_retrieval_query(
+    history: List[Dict[str, Any]],
+    current_user_text: str,
+    component_hint: Optional[str] = None,
+    max_messages: int = 10,
+) -> str:
+    """Build a compact second-chance retrieval query from the recent diagnostic thread.
+
+    Short answers often only make sense beside the question they answered. For
+    example, "No, it's silent" and "Fully retracted" are much more useful for
+    retrieval when the nearby assistant questions are retained.
+
+    This helper is used only as a second-chance retrieval query, so the normal
+    successful retrieval path is unchanged.
+    """
+    rows: List[str] = []
+
+    for m in (history or [])[-max_messages:]:
+        role = (m.get("role") or "").strip().lower()
+        raw = clean_ai_response_text(str(m.get("text") or "")).strip()
+        if not raw:
+            continue
+
+        if role == "user":
+            rows.append(f"Customer: {raw}")
+        elif role == "assistant" and "?" in raw:
+            # Intake/diagnostic questions give meaning to short customer replies.
+            rows.append(f"Diagnostic question: {raw}")
+
+    current = clean_ai_response_text(current_user_text or "").strip()
+    if current:
+        rows.append(f"Customer: {current}")
+
+    component = clean_ai_response_text(component_hint or "").strip()
+    if component:
+        rows.insert(0, f"Recognized Airstream component: {component}")
+
+    # De-duplicate adjacent/exact repeated lines without losing order.
+    out: List[str] = []
+    seen: Set[str] = set()
+    for row in rows:
+        key = row.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(row)
+
+    return "\n".join(out).strip()
 
 def rewrite_user_with_previous_context(
     user_text: str,
@@ -3203,7 +3240,6 @@ def chat(req: ChatRequest):
     # the classifier is sufficiently confident.
     component_hint: str = ""
     component_confidence: float = 0.0
-    targeted_component_question: str = ""
 
     # We may need vector search; embedding must be computed outside DB
     need_vector_search = False
@@ -3494,7 +3530,6 @@ def chat(req: ChatRequest):
         scope_reason,
         component_hint,
         component_confidence,
-        targeted_component_question,
     ) = classify_airstream_scope(
         user_message=req.message,
         history=history,
@@ -3635,6 +3670,72 @@ def chat(req: ChatRequest):
                     e,
                 )
 
+    # If retrieval still has no KB context, use all recent diagnostic evidence
+    # before the vector search. This prevents important answers from being lost
+    # just because they were short (for example: "No, it's silent" followed by
+    # "Fully retracted").
+    if not context_chunks:
+        accumulated_query = build_accumulated_issue_retrieval_query(
+            history=history,
+            current_user_text=req.message,
+            component_hint=component_hint,
+        )
+
+        if accumulated_query:
+            retrieval_query = accumulated_query
+
+            # One second-chance keyword pass with the accumulated evidence.
+            try:
+                with db() as conn:
+                    with conn.transaction():
+                        accumulated_ranked = keyword_kb_articles(
+                            conn,
+                            retrieval_query,
+                            year,
+                            category,
+                            top_k=6,
+                        )
+
+                    for r, score in accumulated_ranked:
+                        if score < 0.15:
+                            continue
+                        if not any(a.get("id") == r.get("id") for a in used_articles):
+                            used_articles.append({"id": r["id"], "title": r["title"]})
+
+                        rt = (r.get("retrieval_text") or "").strip()
+                        body = (r.get("body") or "").strip()
+                        chunk = f"TITLE: {r['title']}\n"
+                        if rt:
+                            chunk += f"RETRIEVAL_TEXT:\n{rt}\n"
+                        chunk += f"BODY:\n{body}"
+                        context_chunks.append(chunk)
+
+                    from_kb = len(context_chunks) > 0
+
+                    if sessions_supports_pinning(conn) and from_kb and accumulated_ranked:
+                        top = accumulated_ranked[0][0]
+                        tree = top.get("decision_tree")
+                        if isinstance(tree, dict) and tree.get("start") and tree.get("nodes"):
+                            exec_no_return(
+                                conn,
+                                """
+                                UPDATE sessions
+                                   SET active_article_id=%s,
+                                       active_tree=%s,
+                                       active_node_id=%s
+                                 WHERE id=%s
+                                """,
+                                (top["id"], json.dumps(tree), tree.get("start"), req.session_id),
+                            )
+                            conn.commit()
+
+            except Exception as e:
+                logger.warning(
+                    "Accumulated-evidence keyword lookup failed session=%s error=%s",
+                    req.session_id,
+                    e,
+                )
+
     # -------------------------
     # Phase 2: Optional vector search (needs OpenAI embedding) — NO DB HELD
     # -------------------------
@@ -3742,68 +3843,59 @@ def chat(req: ChatRequest):
 
                 from_kb = len(context_chunks) > 0
 
-    # HARD GROUNDING GATE: do not call the answer model until relevant
-    # troubleshooting knowledge has actually been loaded from Supabase/Postgres.
-    # This prevents the first AI turn from answering from generic model knowledge
-    # while retrieval is empty or failed.
+    # HARD GROUNDING GATE:
+    # Troubleshooting advice still requires Supabase/Postgres knowledge.
+    #
+    # Intake questions are different: when natural_intake_mode=True the answer
+    # model is hard-limited to ONE clarifying question and cannot give repair
+    # advice. Allowing that question model to run prevents the scope/component
+    # classifier from independently inventing redundant questions.
     knowledge_ready = bool(context_chunks or authoritative_facts)
-    if not knowledge_ready:
+
+    if not knowledge_ready and not natural_intake_mode:
         logger.warning(
-            "No Supabase knowledge available for chat turn session=%s year=%s category=%s",
+            "No Supabase knowledge available after accumulated retrieval "
+            "session=%s year=%s category=%s component=%s",
             req.session_id,
             year,
             category,
+            component_hint or "(none)",
         )
-        if targeted_component_question:
-            fallback_question = targeted_component_question
-        elif component_hint:
-            fallback_question = (
-                f"I understand you mean the {component_hint}. "
-                "What does it do when you try to operate it?"
+
+        if component_hint:
+            fallback_message = (
+                f"I understand you mean the {component_hint}, but I still couldn't match "
+                "the details you've given me to grounded Airstream troubleshooting information. "
+                "I don't want to guess at the next repair step."
             )
         else:
-            fallback_question = (
-                "I need one more detail to match this to the right Airstream information. "
-                "What exactly happens when you try it?"
+            fallback_message = (
+                "I understand the symptoms you've given me, but I still couldn't match them "
+                "to grounded Airstream troubleshooting information. I don't want to guess at "
+                "the next repair step."
             )
 
-        # Even though we do not yet have grounded troubleshooting knowledge,
-        # this is still an intake/question-only turn. Generate dynamic answers
-        # for the clarification question so the mobile quick-reply UI keeps
-        # working. These choices answer the question only; they do not provide
-        # troubleshooting advice.
-        fallback_answer_choices: List[str] = []
-        if fallback_question:
-            fallback_answer_choices = generate_dynamic_answer_choices(
-                question=fallback_question,
-                history=history,
-                current_user_message=req.message,
-                airstream_year=year,
-                category=category,
-                knowledge_context=(
-                    (f"Recognized Airstream component: {component_hint}\n" if component_hint else "")
-                    + ("\n".join(authoritative_facts) if authoritative_facts else "")
-                ).strip(),
-            )
-
-        # Save the turn so the conversation does not break or show a blank bubble.
+        # End the clarification loop instead of asking another question that may
+        # simply restate something the customer already answered.
         with db() as conn:
             if sessions_supports_active_question(conn):
                 exec_no_return(
                     conn,
-                    "UPDATE sessions SET active_question_text=%s WHERE id=%s",
-                    (fallback_question, req.session_id),
+                    "UPDATE sessions SET active_question_text=NULL WHERE id=%s",
+                    (req.session_id,),
                 )
+
             log_message(conn, req.session_id, "user", req.message)
-            log_message(conn, req.session_id, "assistant", fallback_question)
+            log_message(conn, req.session_id, "assistant", fallback_message)
             conn.commit()
 
         return ChatResponse(
-            answer=fallback_question,
+            answer=fallback_message,
+            in_scope=True,
             checkpoint_summary=None,
             clarifying_questions=[],
             knowledge_ready=False,
-            answer_choices=fallback_answer_choices,
+            answer_choices=[],
             safety_flags=flags,
             confidence=0.0,
             used_articles=[],
@@ -3835,9 +3927,10 @@ def chat(req: ChatRequest):
             "RECOGNIZED_COMPONENT_CONTEXT:\n"
             f"The customer's likely Airstream component is: {component_hint}. "
             "Treat this as a high-confidence interpretation, not as a reason to ask them "
-            "what component they mean again. If clarification is still needed, ask about "
-            "the component's observable behavior/state instead. Do not override explicit "
-            "customer corrections."
+            "what component they mean again. Review RECENT CHAT HISTORY before asking anything. "
+            "Do not ask the customer to reconfirm a fact that is already established by their "
+            "prior answers. If clarification is still genuinely needed, ask only about a NEW "
+            "observable behavior/state. Do not override explicit customer corrections."
         )
         flow_instruction = (
             flow_instruction + "\n\n" + component_instruction
