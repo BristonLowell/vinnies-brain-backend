@@ -357,6 +357,21 @@ OPENAI_SCOPE_MODEL = os.getenv(
     os.getenv("OPENAI_SUMMARY_MODEL", "gpt-4o-mini"),
 ).strip()
 
+
+# Used only when the local curated database cannot supply enough information
+# after intake. The source order is intentionally:
+#   1) local database
+#   2) official Airstream manuals
+#   3) official component/manufacturer manuals
+#   4) broader online technical search
+OPENAI_WEB_SEARCH_MODEL = os.getenv(
+    "OPENAI_WEB_SEARCH_MODEL",
+    os.getenv("OPENAI_SUMMARY_MODEL", "gpt-4o-mini"),
+).strip()
+
+OPENAI_WEB_SEARCH_ENABLED = os.getenv("OPENAI_WEB_SEARCH_ENABLED", "1").strip() == "1"
+OPENAI_WEB_SEARCH_TIMEOUT_SEC = float(os.getenv("OPENAI_WEB_SEARCH_TIMEOUT_SEC", "20"))
+
 def send_escalation_email(to_email: str, subject: str, body: str) -> bool:
     """Best-effort Gmail SMTP send.
 
@@ -1056,8 +1071,9 @@ class ChatResponse(BaseModel):
     in_scope: bool = True
     checkpoint_summary: Optional[CheckpointSummary] = None
     clarifying_questions: List[str]
-    # False means the backend did not obtain relevant Supabase knowledge, so the
-    # mobile app must not display an AI answer for this turn.
+    # True when an approved troubleshooting knowledge path is available.
+    # The source hierarchy is local database -> Airstream manuals ->
+    # manufacturer manuals -> broader online technical search.
     knowledge_ready: bool = True
     # Two or three AI-generated quick replies for question-only/intake responses.
     # The mobile app adds “I’m not sure” itself.
@@ -2435,6 +2451,195 @@ def rewrite_short_answer(user_text: str, active_question_text: Optional[str]) ->
 
 
 
+
+# =========================
+# External knowledge cascade
+# =========================
+def _extract_responses_api_text(payload: Any) -> str:
+    """Best-effort extraction of visible text from an OpenAI Responses API payload."""
+    if not isinstance(payload, dict):
+        return ""
+
+    # Some client/proxy versions expose a convenience field.
+    direct = payload.get("output_text")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+
+    parts: List[str] = []
+    for item in payload.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "message":
+            continue
+        for content in item.get("content") or []:
+            if not isinstance(content, dict):
+                continue
+            if content.get("type") in {"output_text", "text"}:
+                value = content.get("text")
+                if isinstance(value, str) and value.strip():
+                    parts.append(value.strip())
+
+    return "\n".join(parts).strip()
+
+
+def _openai_web_search_research(
+    *,
+    retrieval_query: str,
+    history: List[Dict[str, Any]],
+    airstream_year: Optional[int],
+    category: Optional[str],
+    source_tier: str,
+) -> Optional[str]:
+    """Search one source tier and return grounded research text when useful.
+
+    This function NEVER writes the customer-facing answer. It only gathers source
+    material for generate_answer(), preserving the normal conversation logic.
+    """
+    if not OPENAI_WEB_SEARCH_ENABLED:
+        return None
+
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        return None
+
+    tier = (source_tier or "").strip().lower()
+
+    if tier == "airstream_manuals":
+        source_rule = (
+            "Search ONLY official Airstream-owned sources and official Airstream manuals/support documents. "
+            "Prefer airstream.com and official Airstream manual/document pages. "
+            "Do not use dealer pages, forums, blogs, social media, or third-party summaries. "
+            "If you cannot find official Airstream material that actually supports a useful next step, return FOUND: no."
+        )
+        tier_label = "OFFICIAL AIRSTREAM MANUALS"
+    elif tier == "manufacturer_manuals":
+        source_rule = (
+            "Search ONLY official component/appliance manufacturer sources, owner manuals, service manuals, "
+            "technical bulletins, or official support documents relevant to the failed Airstream component. "
+            "Do not guess the manufacturer or model. If the exact manufacturer/model cannot be established "
+            "well enough to make the document applicable, return FOUND: no. "
+            "Do not use forums, dealer pages, blogs, or third-party summaries."
+        )
+        tier_label = "OFFICIAL MANUFACTURER MANUALS"
+    else:
+        source_rule = (
+            "Search the broader web for reliable technical information relevant to this Airstream issue. "
+            "Prefer official technical documents, established RV technical resources, service documentation, "
+            "and well-supported troubleshooting material. Avoid using a forum/social post as the sole basis "
+            "for a repair instruction. If sources conflict, favor official documentation."
+        )
+        tier_label = "ONLINE TECHNICAL SEARCH"
+
+    recent_history = format_transcript((history or [])[-12:], max_chars=6000)
+
+    prompt = (
+        f"You are gathering troubleshooting evidence for Vinnie's Brain.\n\n"
+        f"SOURCE TIER: {tier_label}\n"
+        f"{source_rule}\n\n"
+        "Return plain text in EXACTLY this structure:\n"
+        "FOUND: yes|no\n"
+        "SUMMARY: concise source-grounded facts or troubleshooting guidance\n"
+        "SOURCES:\n"
+        "- source title | source URL\n"
+        "- source title | source URL\n\n"
+        "Rules:\n"
+        "- FOUND: yes only if the searched sources contain information genuinely useful to the current issue.\n"
+        "- Do not invent model-year-specific specifications, part numbers, wiring colors, measurements, or procedures.\n"
+        "- Respect the customer's already-reported observations; do not reset the diagnosis.\n"
+        "- Do not write the final customer-facing response.\n"
+        "- Keep the summary under about 900 words.\n\n"
+        f"Airstream year: {airstream_year if airstream_year is not None else 'unknown'}\n"
+        f"Category: {category or 'unknown'}\n\n"
+        f"Current retrieval query:\n{retrieval_query}\n\n"
+        f"Recent conversation:\n{recent_history or '(none)'}"
+    )
+
+    body = {
+        "model": OPENAI_WEB_SEARCH_MODEL or "gpt-4o-mini",
+        "input": prompt,
+        "tools": [{"type": "web_search"}],
+    }
+
+    url = "https://api.openai.com/v1/responses"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        if requests is not None:
+            response = requests.post(
+                url,
+                headers=headers,
+                json=body,
+                timeout=OPENAI_WEB_SEARCH_TIMEOUT_SEC,
+            )
+            if not response.ok:
+                logger.warning(
+                    "External source search failed tier=%s status=%s body=%s",
+                    source_tier,
+                    response.status_code,
+                    response.text[:500],
+                )
+                return None
+            payload = response.json()
+        else:
+            data = json.dumps(body).encode("utf-8")
+            req = urllib.request.Request(url, headers=headers, data=data, method="POST")
+            with urllib.request.urlopen(req, timeout=OPENAI_WEB_SEARCH_TIMEOUT_SEC) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+
+        result_text = _extract_responses_api_text(payload)
+        if not result_text:
+            return None
+
+        found_match = re.search(r"(?im)^\s*FOUND\s*:\s*(yes|no)\s*$", result_text)
+        if not found_match or found_match.group(1).lower() != "yes":
+            return None
+
+        return (
+            f"SOURCE_TIER: {tier_label}\n"
+            f"{result_text}"
+        ).strip()
+
+    except Exception as e:
+        logger.warning("External source search exception tier=%s error=%s", source_tier, e)
+        return None
+
+
+def retrieve_external_knowledge_cascade(
+    *,
+    retrieval_query: str,
+    history: List[Dict[str, Any]],
+    airstream_year: Optional[int],
+    category: Optional[str],
+) -> Tuple[Optional[str], Optional[str]]:
+    """Try external sources in strict priority order.
+
+    Returns:
+      (source_tier, grounded_context)
+
+    Priority:
+      Airstream manuals -> manufacturer manuals -> broader online search
+
+    The local database is searched BEFORE this helper is called, so the full
+    application hierarchy is:
+      database -> Airstream manuals -> manufacturer manuals -> online search.
+    """
+    for tier in ("airstream_manuals", "manufacturer_manuals", "online_search"):
+        result = _openai_web_search_research(
+            retrieval_query=retrieval_query,
+            history=history,
+            airstream_year=airstream_year,
+            category=category,
+            source_tier=tier,
+        )
+        if result:
+            return tier, result
+
+    return None, None
+
+
 # =========================
 # RAG helpers
 # =========================
@@ -3584,64 +3789,64 @@ def chat(req: ChatRequest):
 
                 from_kb = len(context_chunks) > 0
 
-    # HARD GROUNDING GATE:
-    # Troubleshooting advice still requires relevant curated knowledge.
+    # KNOWLEDGE SOURCE CASCADE:
+    # The local curated database remains highest priority. A database miss is NOT
+    # a reason to stop. Once intake is complete, continue through:
     #
-    # Intake is different: when natural_intake_mode=True, generate_answer() is
-    # called with intake_only=True, which hard-limits the model to ONE clarifying
-    # question and prevents troubleshooting/repair advice. Therefore, if retrieval
-    # misses during intake, let the normal intake model ask the next natural,
-    # history-aware question instead of returning a canned fallback sentence.
+    #   database -> official Airstream manuals -> official manufacturer manuals
+    #   -> broader online technical search
+    #
+    # This keeps the existing conversation state intact while preventing a single
+    # retrieval miss from producing a canned "I need one more detail" dead end.
     knowledge_ready = bool(context_chunks or authoritative_facts)
+    external_source_tier: Optional[str] = None
 
     if not knowledge_ready and not natural_intake_mode:
-        logger.warning(
-            "No Supabase knowledge available for chat turn session=%s year=%s category=%s",
+        logger.info(
+            "Curated database miss; starting external source cascade "
+            "session=%s year=%s category=%s",
             req.session_id,
             year,
             category,
         )
-        fallback_question = (
-            "I need one more detail to match this to the right Airstream information. "
-            "What exactly happens when you try it?"
-        )
 
-        # This is still a question-only clarification turn, so keep the
-        # dynamic quick-reply UI available even though curated retrieval missed.
-        fallback_answer_choices = generate_dynamic_answer_choices(
-            question=fallback_question,
+        external_source_tier, external_context = retrieve_external_knowledge_cascade(
+            retrieval_query=retrieval_query,
             history=history,
-            current_user_message=req.message,
             airstream_year=year,
             category=category,
-            knowledge_context="",
         )
 
-        # Save the turn so the conversation does not break or show a blank bubble.
-        with db() as conn:
-            if sessions_supports_active_question(conn):
-                exec_no_return(
-                    conn,
-                    "UPDATE sessions SET active_question_text=%s WHERE id=%s",
-                    (fallback_question, req.session_id),
-                )
-            log_message(conn, req.session_id, "user", req.message)
-            log_message(conn, req.session_id, "assistant", fallback_question)
-            conn.commit()
-
-        return ChatResponse(
-            answer=fallback_question,
-            checkpoint_summary=None,
-            clarifying_questions=[],
-            knowledge_ready=False,
-            answer_choices=fallback_answer_choices,
-            safety_flags=flags,
-            confidence=0.0,
-            used_articles=[],
-            show_escalation=False,
-            is_troubleshooting_response=False,
-            message_id=message_id,
-        )
+        if external_context:
+            context_chunks.append(external_context)
+            knowledge_ready = True
+            logger.info(
+                "External knowledge found session=%s tier=%s",
+                req.session_id,
+                external_source_tier,
+            )
+        else:
+            # Never fall back to the old generic canned question merely because
+            # the database missed. Let the normal answer model continue with a
+            # conservative instruction. It may ask ONE genuinely diagnostic
+            # question if more information is actually required.
+            logger.warning(
+                "External source cascade returned no usable source "
+                "session=%s; continuing conservatively",
+                req.session_id,
+            )
+            flow_instruction = (
+                flow_instruction + "\n\n"
+                if flow_instruction
+                else ""
+            ) + (
+                "KNOWLEDGE_SOURCE_INSTRUCTION:\n"
+                "The curated database and external source cascade did not return usable source material for this turn. "
+                "Do not invent model-specific specifications, part numbers, wiring details, measurements, or repair procedures. "
+                "Use only well-established Airstream/RV system knowledge you are confident about. "
+                "If another observation is genuinely required before a safe next step can be chosen, ask exactly ONE targeted diagnostic question based on the existing conversation. "
+                "Do not use a canned generic request for more detail, and do not repeat a question or fact already established."
+            )
 
     # Prepare rewritten_user_message again (we computed it inside DB phase, but keep it stable)
     rewritten_user_message = rewrite_user_with_previous_context(
@@ -3660,6 +3865,21 @@ def chat(req: ChatRequest):
             )
         else:
             flow_instruction = build_concise_troubleshooting_instruction()
+
+    if external_source_tier:
+        source_priority_instruction = (
+            "SOURCE_PRIORITY_INSTRUCTION:\n"
+            "Use troubleshooting sources in this order of authority: "
+            "1) Vinnie's curated database/kb_facts/kb_articles, "
+            "2) official Airstream manuals/support documents, "
+            "3) official component/manufacturer manuals, "
+            "4) broader online technical sources. "
+            "If lower-priority information conflicts with a higher-priority source, follow the higher-priority source. "
+            "Do not invent details that are not supported by the available source material."
+        )
+        flow_instruction = (
+            flow_instruction + "\n\n" + source_priority_instruction
+        ).strip() if flow_instruction else source_priority_instruction
 
     response_context = (
         flow_instruction + "\n\n---\n\n" + "\n\n---\n\n".join(context_chunks)
