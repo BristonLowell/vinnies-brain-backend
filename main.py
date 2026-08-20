@@ -1443,6 +1443,52 @@ def is_greeting(text: str) -> bool:
     return t in {"hi", "hello", "hey", "hi there", "hey there", "good morning", "good afternoon", "good evening"}
 
 
+def _explicit_scope_correction_or_switch(text: str) -> bool:
+    """True when the customer is explicitly correcting/changing the actual problem."""
+    t = re.sub(r"\s+", " ", (text or "").strip().lower().replace("’", "'"))
+    if not t:
+        return False
+
+    correction_markers = (
+        "actually",
+        "i meant",
+        "i mean ",
+        "what i meant",
+        "correction",
+        "to clarify",
+        "not the airstream",
+        "isn't the airstream",
+        "is not the airstream",
+        "different issue",
+        "different problem",
+        "new issue",
+        "switch topic",
+        "switch topics",
+    )
+    return any(marker in t for marker in correction_markers)
+
+
+def should_inherit_airstream_scope(
+    *,
+    user_message: str,
+    previous_question: Optional[str],
+) -> bool:
+    """Short answers to the active Airstream question inherit that thread's scope."""
+    message = (user_message or "").strip()
+    question = (previous_question or "").strip()
+
+    if not message or not question:
+        return False
+    if "?" in message:
+        return False
+    if should_reset_flow(message):
+        return False
+    if _explicit_scope_correction_or_switch(message):
+        return False
+
+    return len(message) <= 180
+
+
 def classify_airstream_scope(
     *,
     user_message: str,
@@ -1493,6 +1539,11 @@ def classify_airstream_scope(
                         "unrelated to trailer braking, tow-vehicle starter/battery/alternator, infotainment, household "
                         "problems, or any other issue whose actual failed system is clearly not the Airstream. "
                         "A selected Airstream model year does NOT make an unrelated problem in scope. "
+                        "If the current message is a short answer to the immediately previous assistant question, "
+                        "interpret it as part of that active troubleshooting thread rather than as a standalone topic. "
+                        "Examples such as 'No sound', 'Yes', 'Just blowing cold air', 'Fully retracted', or other quick replies "
+                        "inherit the Airstream context of the question they answer. "
+                        "Only reclassify the actual problem when the customer explicitly corrects, replaces, or changes the topic. "
                         "If the current message corrects earlier context and clearly identifies a non-Airstream problem, "
                         "classify it out of scope. "
                         "If the issue is genuinely ambiguous and could still be an Airstream or trailer-interface problem, "
@@ -3738,17 +3789,32 @@ def chat(req: ChatRequest):
     # -------------------------
     # Scope classification (OpenAI, NO DB HELD)
     # -------------------------
-    in_scope, scope_reason = classify_airstream_scope(
+    # Short answers to the immediately previous Airstream question inherit
+    # the active thread's scope. Dynamic quick replies often look ambiguous
+    # when read by themselves, so they should not be reclassified as new topics.
+    #
+    # Explicit corrections/topic switches still go through the normal classifier.
+    inherit_scope = should_inherit_airstream_scope(
         user_message=req.message,
-        history=history,
-        airstream_year=year,
-        category=category,
+        previous_question=question_for_linking,
     )
 
+    if inherit_scope:
+        in_scope = True
+        scope_reason = "followup_answer_inherits_active_airstream_scope"
+    else:
+        in_scope, scope_reason = classify_airstream_scope(
+            user_message=req.message,
+            history=history,
+            airstream_year=year,
+            category=category,
+        )
+
     logger.info(
-        "Scope classification session=%s in_scope=%s reason=%s",
+        "Scope classification session=%s in_scope=%s inherited=%s reason=%s",
         req.session_id,
         in_scope,
+        inherit_scope,
         scope_reason[:300],
     )
 
