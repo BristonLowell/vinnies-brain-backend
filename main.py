@@ -3584,12 +3584,17 @@ def chat(req: ChatRequest):
 
                 from_kb = len(context_chunks) > 0
 
-    # HARD GROUNDING GATE: do not call the answer model until relevant
-    # troubleshooting knowledge has actually been loaded from Supabase/Postgres.
-    # This prevents the first AI turn from answering from generic model knowledge
-    # while retrieval is empty or failed.
+    # HARD GROUNDING GATE:
+    # Troubleshooting advice still requires relevant curated knowledge.
+    #
+    # Intake is different: when natural_intake_mode=True, generate_answer() is
+    # called with intake_only=True, which hard-limits the model to ONE clarifying
+    # question and prevents troubleshooting/repair advice. Therefore, if retrieval
+    # misses during intake, let the normal intake model ask the next natural,
+    # history-aware question instead of returning a canned fallback sentence.
     knowledge_ready = bool(context_chunks or authoritative_facts)
-    if not knowledge_ready:
+
+    if not knowledge_ready and not natural_intake_mode:
         logger.warning(
             "No Supabase knowledge available for chat turn session=%s year=%s category=%s",
             req.session_id,
