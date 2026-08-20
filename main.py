@@ -350,6 +350,13 @@ OPENAI_ANSWER_CHOICES_MODEL = os.getenv(
     os.getenv("OPENAI_SUMMARY_MODEL", "gpt-4o-mini"),
 ).strip()
 
+
+# Small classification call used to hard-enforce Vinnie's Brain scope.
+OPENAI_SCOPE_MODEL = os.getenv(
+    "OPENAI_SCOPE_MODEL",
+    os.getenv("OPENAI_SUMMARY_MODEL", "gpt-4o-mini"),
+).strip()
+
 def send_escalation_email(to_email: str, subject: str, body: str) -> bool:
     """Best-effort Gmail SMTP send.
 
@@ -1044,6 +1051,9 @@ class CheckpointSummary(BaseModel):
 
 class ChatResponse(BaseModel):
     answer: str
+    # True only when the customer's actual problem is within Vinnie's Brain's
+    # Airstream troubleshooting scope.
+    in_scope: bool = True
     checkpoint_summary: Optional[CheckpointSummary] = None
     clarifying_questions: List[str]
     # False means the backend did not obtain relevant Supabase knowledge, so the
@@ -1417,11 +1427,88 @@ def is_greeting(text: str) -> bool:
     return t in {"hi", "hello", "hey", "hi there", "hey there", "good morning", "good afternoon", "good evening"}
 
 
-def is_airstream_question(text: str, year: Optional[int]) -> bool:
-    if year is not None:
-        return True
-    t = (text or "").lower()
-    return any(k in t for k in ["airstream", "trailer", "rv", "camping", "leveling", "leak", "water", "furnace", "ac"])
+def classify_airstream_scope(
+    *,
+    user_message: str,
+    history: List[Dict[str, Any]],
+    airstream_year: Optional[int],
+    category: Optional[str],
+) -> Tuple[bool, str]:
+    """Classify whether the customer's ACTUAL problem is within app scope.
+
+    Hard rule: in_scope = false when the user's actual problem is clearly not
+    with the Airstream, an Airstream-installed system, or the trailer-side
+    connection/interface to the tow vehicle.
+
+    If classification is unavailable or genuinely ambiguous, fail open so a
+    legitimate Airstream issue is not incorrectly blocked.
+    """
+    message = clean_ai_response_text(user_message or "").strip()
+    if not message:
+        return True, "empty_message"
+
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if OpenAI is None or not api_key:
+        logger.warning("Scope classifier unavailable; allowing chat turn")
+        return True, "classifier_unavailable"
+
+    recent_history = format_transcript((history or [])[-10:], max_chars=4500)
+
+    try:
+        client = OpenAI(api_key=api_key)  # type: ignore[operator]
+        resp = client.chat.completions.create(
+            model=OPENAI_SCOPE_MODEL or "gpt-4o-mini",
+            temperature=0.0,
+            max_tokens=120,
+            response_format={"type": "json_object"},
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a scope classifier for Vinnie's Brain, an Airstream troubleshooting app. "
+                        "Classify the customer's ACTUAL problem, not merely words that appear in the conversation. "
+                        "Return JSON only: {\"in_scope\":true,\"reason\":\"short reason\"}. "
+                        "Set in_scope=false when the user's actual problem is clearly NOT with the Airstream, "
+                        "an Airstream-installed system, or the trailer-side connection/interface to the tow vehicle. "
+                        "Examples that are IN scope: Airstream appliances/systems, trailer running/marker/brake lights, "
+                        "the Airstream side of a 7-pin connection, trailer brakes, or diagnosing whether a tow-vehicle "
+                        "connection is failing to operate an Airstream function. "
+                        "Examples that are OUT of scope: tow-vehicle headlights, tow-vehicle engine, tow-vehicle brakes "
+                        "unrelated to trailer braking, tow-vehicle starter/battery/alternator, infotainment, household "
+                        "problems, or any other issue whose actual failed system is clearly not the Airstream. "
+                        "A selected Airstream model year does NOT make an unrelated problem in scope. "
+                        "If the current message corrects earlier context and clearly identifies a non-Airstream problem, "
+                        "classify it out of scope. "
+                        "If the issue is genuinely ambiguous and could still be an Airstream or trailer-interface problem, "
+                        "classify it in scope so the assistant may ask one clarifying question."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Airstream year: {airstream_year if airstream_year is not None else 'unknown'}\n"
+                        f"Category: {category or 'unknown'}\n\n"
+                        f"Recent conversation:\n{recent_history or '(none)'}\n\n"
+                        f"Customer's current message:\n{message}"
+                    ),
+                },
+            ],
+        )
+
+        raw = (resp.choices[0].message.content or "").strip()
+        data = json.loads(raw) if raw else {}
+        in_scope = data.get("in_scope")
+        reason = clean_ai_response_text(str(data.get("reason") or "")).strip()
+
+        if isinstance(in_scope, bool):
+            return in_scope, reason or ("in_scope" if in_scope else "out_of_scope")
+
+        logger.warning("Scope classifier returned invalid payload: %s", raw[:500])
+        return True, "invalid_classifier_payload"
+
+    except Exception as e:
+        logger.warning("Scope classifier failed: %s", e)
+        return True, "classifier_error"
 
 
 def require_admin(x_admin_key: str) -> None:
@@ -3067,24 +3154,6 @@ def chat(req: ChatRequest):
                 message_id=message_id,
             )
 
-        if not is_airstream_question(req.message, year):
-            # log user msg + assistant reply quickly
-            msg = "I can help with Airstream troubleshooting. What system are you working on (water, electrical, appliances, leaks, etc.)?"
-            log_message(conn, req.session_id, "user", req.message)
-            log_message(conn, req.session_id, "assistant", msg)
-            conn.commit()
-
-            return ChatResponse(
-                answer=msg,
-                clarifying_questions=[],
-                safety_flags=flags,
-                confidence=0.4,
-                used_articles=[],
-                show_escalation=False,
-                is_troubleshooting_response=False,
-                message_id=message_id,
-            )
-
         pin_supported = sessions_supports_pinning(conn)
         aq_supported = sessions_supports_active_question(conn)
 
@@ -3324,6 +3393,65 @@ def chat(req: ChatRequest):
     except Exception:
         # do not crash if subscription check fails unexpectedly
         pass
+
+    # -------------------------
+    # Scope classification (OpenAI, NO DB HELD)
+    # -------------------------
+    in_scope, scope_reason = classify_airstream_scope(
+        user_message=req.message,
+        history=history,
+        airstream_year=year,
+        category=category,
+    )
+
+    logger.info(
+        "Scope classification session=%s in_scope=%s reason=%s",
+        req.session_id,
+        in_scope,
+        scope_reason[:300],
+    )
+
+    if not in_scope:
+        scope_message = (
+            "That appears to be outside Airstream troubleshooting. "
+            "Vinnie’s Brain is limited to the Airstream, Airstream-installed systems, "
+            "and the trailer-side connection/interface to the tow vehicle."
+        )
+
+        # Clear any stale pending question so a later Airstream message is not
+        # incorrectly attached to the out-of-scope turn.
+        with db() as conn:
+            if sessions_supports_active_question(conn):
+                exec_no_return(
+                    conn,
+                    "UPDATE sessions SET active_question_text=NULL WHERE id=%s",
+                    (req.session_id,),
+                )
+
+            log_message(conn, req.session_id, "user", req.message)
+            _telemetry_insert(
+                conn,
+                req.session_id,
+                "chat_out_of_scope",
+                {"reason": scope_reason[:500]},
+            )
+            log_message(conn, req.session_id, "assistant", scope_message)
+            conn.commit()
+
+        return ChatResponse(
+            answer=scope_message,
+            in_scope=False,
+            checkpoint_summary=None,
+            clarifying_questions=[],
+            knowledge_ready=True,
+            answer_choices=[],
+            safety_flags=flags,
+            confidence=0.98,
+            used_articles=[],
+            show_escalation=False,
+            is_troubleshooting_response=False,
+            message_id=message_id,
+        )
 
     # -------------------------
     # Phase 2: Optional vector search (needs OpenAI embedding) — NO DB HELD
@@ -3605,6 +3733,7 @@ def chat(req: ChatRequest):
 
     return ChatResponse(
         answer=answer,
+        in_scope=True,
         checkpoint_summary=CheckpointSummary(**checkpoint_summary) if isinstance(checkpoint_summary, dict) else None,
         clarifying_questions=clarifying,
         knowledge_ready=True,
