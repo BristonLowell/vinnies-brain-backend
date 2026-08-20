@@ -1798,6 +1798,10 @@ def build_concise_troubleshooting_instruction() -> str:
     return (
         "RESPONSE_STYLE_INSTRUCTION:\n"
         "The customer is now past intake. Give concise troubleshooting help. "
+        "For every actual troubleshooting/advice response, begin with exactly one short line in this format: "
+        "'Most likely: <brief likely cause or system area>'. "
+        "Keep the Most likely line to one short sentence and do not overstate certainty. "
+        "If you are returning ONLY a clarifying question, do not include a Most likely line. "
         "Give only 1 or 2 NEW checks at a time. "
         "Each check must be one simple action, not several checks bundled into one bullet. "
         "Keep each check brief, usually one sentence and preferably under about 25 words. "
@@ -1828,6 +1832,9 @@ def build_troubleshooting_followup_instruction(
         "TROUBLESHOOTING_FOLLOWUP_INSTRUCTION:\n"
         "The customer is responding to the immediately previous troubleshooting response in RECENT CHAT HISTORY. "
         "Use the customer's new result to MOVE FORWARD in the diagnosis. "
+        "If you provide actual troubleshooting/advice, begin with exactly one short line: "
+        "'Most likely: <brief likely cause or system area>'. Keep it concise and appropriately uncertain. "
+        "If you return only a clarifying question, do not include a Most likely line. "
         "Do not repeat, restate, reword, summarize, or re-list the immediately previous troubleshooting steps unless the customer specifically asks you to repeat them. "
         "Do not start over from the beginning. "
         "Treat checks the customer says they completed as completed. "
@@ -1884,6 +1891,111 @@ def clean_clarifying_questions(questions: Any) -> List[str]:
         if qs:
             cleaned.append(qs)
     return cleaned
+
+
+def recover_structured_ai_response(
+    answer: str,
+    clarifying: Any,
+    confidence: float,
+) -> Tuple[str, List[str], float]:
+    """Defense-in-depth against raw JSON leaking into the customer chat.
+
+    openai_client.py already parses the structured response. This helper exists
+    because the mobile UI should never display a JSON object even if a model/SDK
+    response slips through as visible answer text.
+    """
+    existing_clarifying = clean_clarifying_questions(clarifying)
+    raw = (answer or "").strip()
+
+    if not raw:
+        return "", existing_clarifying, confidence
+
+    candidate = raw
+
+    # Strip a single markdown JSON fence if one slipped through.
+    candidate = re.sub(r"^\s*```(?:json)?\s*", "", candidate, flags=re.IGNORECASE)
+    candidate = re.sub(r"\s*```\s*$", "", candidate).strip()
+
+    # Only attempt JSON recovery for object-shaped output containing the fields
+    # used by Vinnie's structured response contract.
+    if not (
+        candidate.startswith("{")
+        and candidate.endswith("}")
+        and (
+            '"answer"' in candidate
+            or '"clarifying_questions"' in candidate
+            or '"confidence"' in candidate
+        )
+    ):
+        return answer, existing_clarifying, confidence
+
+    try:
+        data = json.loads(candidate)
+    except Exception:
+        return answer, existing_clarifying, confidence
+
+    if not isinstance(data, dict):
+        return answer, existing_clarifying, confidence
+
+    recovered_answer = clean_ai_response_text(str(data.get("answer") or ""))
+
+    recovered_questions = clean_clarifying_questions(
+        data.get("clarifying_questions") or []
+    )
+    if not recovered_questions:
+        recovered_questions = existing_clarifying
+
+    recovered_confidence = confidence
+    try:
+        recovered_confidence = clamp01(float(data.get("confidence", confidence)))
+    except Exception:
+        pass
+
+    return recovered_answer, recovered_questions[:1], recovered_confidence
+
+
+def remove_duplicate_clarifying_question_from_answer(
+    answer: str,
+    clarifying: List[str],
+) -> str:
+    """Ensure a clarifying question is rendered only once.
+
+    The frontend displays clarifying_questions separately. If the same question
+    also appears in answer text, remove that copy from the answer.
+    """
+    out = (answer or "").strip()
+    if not out or not clarifying:
+        return out
+
+    for q in clarifying[:1]:
+        question = clean_ai_response_text(str(q or "")).strip()
+        if not question:
+            continue
+
+        # Remove optional markdown wrappers from comparison text.
+        if question.startswith("**") and question.endswith("**") and len(question) > 4:
+            question = question[2:-2].strip()
+
+        if not question:
+            continue
+
+        # Remove exact standalone question lines first.
+        kept: List[str] = []
+        for line in out.splitlines():
+            line_clean = clean_ai_response_text(line).strip()
+            if line_clean.casefold() == question.casefold():
+                continue
+            kept.append(line)
+
+        out = "\n".join(kept).strip()
+
+        # Defensive exact-text removal if the question was embedded inline.
+        if question and question.casefold() in out.casefold():
+            pattern = re.compile(re.escape(question), flags=re.IGNORECASE)
+            out = pattern.sub("", out).strip()
+
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    return out.strip()
 
 
 def _normalize_choice_for_similarity(choice: str) -> str:
@@ -3903,9 +4015,18 @@ def chat(req: ChatRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"LLM error: {e}")
 
+    # Defense-in-depth: never allow structured JSON to leak into the visible
+    # answer, and never render the same clarifying question twice.
+    answer, clarifying, confidence = recover_structured_ai_response(
+        answer,
+        clarifying,
+        confidence,
+    )
+
     # Clean markdown artifacts before storing or showing the answer.
     answer = clean_ai_response_text(answer)
     clarifying = clean_clarifying_questions(clarifying)
+    answer = remove_duplicate_clarifying_question_from_answer(answer, clarifying)
 
     # Intake turns are question-only in the customer UI. Even if the model
     # returns explanatory text, discard it and keep only the single question.

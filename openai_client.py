@@ -191,10 +191,6 @@ Hard rule:
 
 SCOPE INTERPRETATION:
 - Even if the user’s message is short or generic, interpret it in the context of the user owning an Airstream travel trailer.
-- Recognize normal Airstream owner shorthand and common component names when the meaning is reasonably clear.
-- Do not behave as though a component is unknown merely because the user used a short everyday name for it.
-- Example: in an Airstream troubleshooting context, "the step" or "door step" will usually mean the exterior entry step below the entry door unless the conversation gives a reason to think otherwise.
-- Do not force an interpretation when multiple genuinely plausible Airstream components remain.
 
 SOURCE PRIORITY (HARD HIERARCHY):
 1) AUTHORITATIVE FACTS (Airstream placard/manual/service docs, or app-provided facts) are highest authority.
@@ -224,6 +220,9 @@ CRITICAL FORMAT RULE (UI requirement):
 - NEVER put the clarifying question in the "answer" text.
 - If a question is required, put it ONLY in "clarifying_questions".
 - Outside intake mode, the "answer" may contain explanation / likely causes / next steps, but NO question.
+- The overall model response must be JSON, but the CONTENT of "answer" must be customer-facing plain text only.
+- NEVER place a JSON object, JSON field names, code fence, or serialized response object inside the "answer" string.
+- Before returning a clarifying question, compare it with RECENT CHAT HISTORY. Do not repeat a question already asked or ask the customer to reconfirm an observation they already supplied.
 - NEVER ask a clarifying question and then write the answer as though one possible answer to that question has already been confirmed.
 - If the missing information is required before choosing the next diagnostic step, set "answer" to an empty string and return ONLY that one clarifying question.
 - An answer plus a clarifying question is allowed only when the answer contains NEW troubleshooting the customer can perform first and the question asks for the RESULT of that new troubleshooting.
@@ -237,6 +236,11 @@ Core behavior:
 - During troubleshooting, prefer 1 or 2 short NEW checks per turn.
 - Keep one action per check; do not bundle several inspections/actions into one long bullet.
 - Do not repeat troubleshooting already present in RECENT CHAT HISTORY unless the user explicitly asks for it again.
+- For every response that contains actual troubleshooting/advice, start the answer with exactly one short customer-facing line:
+  Most likely: <brief likely cause or system area>
+- Keep that line concise and appropriately uncertain; do not claim a confirmed diagnosis unless the evidence supports it.
+- After the Most likely line, give the 1 or 2 new checks.
+- If the response is question-only, set answer="" and do NOT include a Most likely line.
 
 QUESTION LIMIT:
 - Ask at most ONE clarifying question per message.
@@ -253,6 +257,9 @@ Return STRICT JSON:
   "clarifying_questions": string[],
   "confidence": number
 }}
+
+The "answer" value must contain ONLY the text the customer should read.
+Do not put this JSON schema, braces, keys, or another JSON object inside "answer".
 """.strip()
 
     if intake_only:
@@ -264,10 +271,6 @@ INTAKE MODE (HARD UI RULE):
 - Set answer to an empty string.
 - Do NOT explain, summarize, diagnose, mention likely causes, give advice, apologize, or add a preamble.
 - The customer-facing output for this turn must be the question only.
-- Act like an experienced Airstream technician. If the customer already named a common component, or normal Airstream context makes the component reasonably clear, do NOT ask what component they mean.
-- Ask about the recognized component's observable condition: whether it moves, powers up, makes a sound, is extended/retracted, leaks, heats, cools, trips, etc., as appropriate to the exact component and symptom.
-- Do not ask for information already present in RECENT CHAT HISTORY or in the current USER MESSAGE.
-- If the customer says "I'm not sure" or similar, ask a different, simpler observation question instead of repeating the same question or assuming an answer.
 """.strip()
 
     kb_block = (context or "").strip()
@@ -349,7 +352,15 @@ INTAKE MODE (HARD UI RULE):
         except Exception:
             answer = out_text
 
-    if not answer and not (intake_only and clarifying):
+    # If the model returned a valid question-only JSON response such as:
+    # {"answer":"","clarifying_questions":["...?"],"confidence":0.74}
+    # do NOT copy the raw Responses API output back into `answer`.
+    #
+    # Previously this fallback ran whenever `answer` was empty outside intake,
+    # even when `clarifying` had already parsed successfully. That caused the
+    # customer UI to display the raw JSON object, then display the same question
+    # again from `clarifying_questions`.
+    if not answer and not clarifying:
         chunks: List[str] = []
         for item in getattr(resp, "output", []) or []:
             for c in getattr(item, "content", []) or []:
