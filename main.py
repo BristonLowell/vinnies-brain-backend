@@ -3767,6 +3767,25 @@ def chat(req: ChatRequest):
                 "What exactly happens when you try it?"
             )
 
+        # Even though we do not yet have grounded troubleshooting knowledge,
+        # this is still an intake/question-only turn. Generate dynamic answers
+        # for the clarification question so the mobile quick-reply UI keeps
+        # working. These choices answer the question only; they do not provide
+        # troubleshooting advice.
+        fallback_answer_choices: List[str] = []
+        if fallback_question:
+            fallback_answer_choices = generate_dynamic_answer_choices(
+                question=fallback_question,
+                history=history,
+                current_user_message=req.message,
+                airstream_year=year,
+                category=category,
+                knowledge_context=(
+                    (f"Recognized Airstream component: {component_hint}\n" if component_hint else "")
+                    + ("\n".join(authoritative_facts) if authoritative_facts else "")
+                ).strip(),
+            )
+
         # Save the turn so the conversation does not break or show a blank bubble.
         with db() as conn:
             if sessions_supports_active_question(conn):
@@ -3784,7 +3803,7 @@ def chat(req: ChatRequest):
             checkpoint_summary=None,
             clarifying_questions=[],
             knowledge_ready=False,
-            answer_choices=[],
+            answer_choices=fallback_answer_choices,
             safety_flags=flags,
             confidence=0.0,
             used_articles=[],
@@ -3882,11 +3901,21 @@ def chat(req: ChatRequest):
         response_question = first_question_from_response(answer, clarifying)
 
     answer_choices: List[str] = []
-    # Dynamic quick replies are ONLY for the initial intake/clarifying phase.
-    # Once troubleshooting begins, never return answer_choices, even if the
-    # troubleshooting response ends with a question.
-    should_offer_answer_choices = natural_intake_mode
-    if not is_troubleshooting_response and response_question and should_offer_answer_choices:
+    # Dynamic quick replies belong to ANY question-only clarification BEFORE
+    # troubleshooting has actually begun. Do not tie them only to the fixed
+    # INTAKE_QUESTION_TURNS counter, because the assistant may still need a
+    # targeted clarification after that soft minimum.
+    #
+    # Once any real troubleshooting response exists in the conversation,
+    # quick replies stay off permanently for this issue.
+    troubleshooting_started_before = _troubleshooting_has_started(history)
+    should_offer_answer_choices = (
+        not troubleshooting_started_before
+        and not is_troubleshooting_response
+        and bool(response_question)
+    )
+
+    if should_offer_answer_choices:
         answer_choices = generate_dynamic_answer_choices(
             question=response_question,
             history=history,
